@@ -1,4 +1,4 @@
-# Python-SuPer
+# SUPER-Python
 
 ## Create the conda environmemt.
 * Creat the conda environment with required packages using the following command:
