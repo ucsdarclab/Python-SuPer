@@ -10,24 +10,16 @@ from utils.utils import *
 
 from utils.pcd2normal import *
 
-def read_imgs(data_dir, img_id, img_format, use_mask=False):
+def read_imgs(data_dir, img_id, img_format):
     
     if dataset_class == 'RGBD_mask':
         depth_file = os.path.join(data_dir,"{0:06d}-depth.{img_format}".format(img_id,img_format=img_format))
-        # image_file = depth_file.replace("depth","color")
         image_file = depth_file.replace("depth","left") # Reading data from folder 'grasp1_2_psmnet'.
 
         rgb = cv2.cvtColor(cv2.imread(image_file), cv2.COLOR_BGR2RGB)
         depth = cv2.imread(depth_file, -1).astype(np.float32)
 
-        if use_mask:
-            mask_file = depth_file.replace("depth","mask") 
-            mask = cv2.imread(mask_file,0)
-            mask = (mask > 0).astype(np.uint8)
-
-            return rgb, depth, mask
-        else:
-            return rgb, depth
+        return rgb, depth
 
 # TODO: Check how this function works in fusion-master.
 # def noise3D(x,y,z):
