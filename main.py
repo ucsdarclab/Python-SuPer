@@ -2,6 +2,7 @@ import numpy as np
 import random
 import argparse
 import copy
+import shutil
 
 import torch.nn as nn
 import torch.optim as optim
@@ -33,16 +34,13 @@ def main():
     # Cost Functions
     parser.add_argument('--data_cost', action='store', type=float, dest='data_cost', default=0.0, help='')
     parser.add_argument('--depth_cost', action='store', type=float, dest='depth_cost', default=0.0, help='')
-    parser.add_argument('--coord_cost', action='store', type=float, dest='coord_cost', default=0.0, help='')
     parser.add_argument('--corr_cost', action='store', type=float, dest='corr_cost', default=0.0, help='')
     parser.add_argument('--arap_cost', action='store', type=float, dest='arap_cost', default=0.0, help='')
     parser.add_argument('--rot_cost', action='store', type=float, dest='rot_cost', default=0.0, help='')
 
     # Use square root of the lambda.
-    parser.add_argument('--data_lambda', action='store', type=float, dest='data_lambda', default=1.0, help='')
-    parser.add_argument('--depth_lambda', action='store', type=float, dest='depth_lambda', default=1.0, help='')
-    parser.add_argument('--deep_depth_lambda', action='store', type=float, dest='deep_depth_lambda', default=1.0, help='')
-    parser.add_argument('--coord_lambda', action='store', type=float, dest='coord_lambda', default=1.0, help='')
+    parser.add_argument('--data_lambda', action='store', type=float, dest='data_lambda', default=1., help='')
+    parser.add_argument('--depth_lambda', action='store', type=float, dest='depth_lambda', default=0.1, help='')
     parser.add_argument('--corr_lambda', action='store', type=float, dest='corr_lambda', default=np.sqrt(10.), help='')
     parser.add_argument('--arap_lambda', action='store', type=float, dest='arap_lambda', default=np.sqrt(10.), help='')
     parser.add_argument('--rot_lambda', action='store', type=float, dest='rot_lambda', default=10.0, help='')
@@ -60,18 +58,12 @@ def main():
     corr_cost = bool(args.corr_cost)
     arap_cost = bool(args.arap_cost)
     rot_cost = bool(args.rot_cost)
-    if args.method == 'super':
-        deep_depth_cost = False
-        coord_cost = False
-    else:
-        deep_depth_cost = bool(args.deep_depth_cost)
-        coord_cost = bool(args.coord_cost)
 
     if args.phase == "test":
         out_filename = name_file(args.method, data_cost, depth_cost, \
-            arap_cost, rot_cost, corr_cost, coord_cost, \
+            arap_cost, rot_cost, corr_cost, \
             args.data_lambda, args.depth_lambda, args.arap_lambda, \
-            args.rot_lambda, args.corr_lambda, args.coord_lambda)
+            args.rot_lambda, args.corr_lambda)
 
     # Prepare empty folder for saving rendering/tracking/etc. results
     reset_folder(output_folder)
@@ -80,16 +72,6 @@ def main():
             os.makedirs(folder)
     if not os.path.exists(evaluate_folder):
         os.makedirs(evaluate_folder)
-    # if evaluate_super and save_20pts_tracking_result:
-    #     os.makedirs(tracking_rst_folder)
-    # if corr_cost and save_img_feature_matching:
-    #     os.makedirs(match_folder)
-    # if save_opt_rst:
-    #     os.makedirs(error_folder)
-    # if qual_color_eval:
-    #     os.makedirs(qual_color_folder)
-    # os.makedirs(render_folder)
-    # os.makedirs(os.path.join(output_folder, "debug")) ##### TODO: For debug, delete
 
     if evaluate_super:
 
@@ -129,11 +111,11 @@ def main():
         print("Total frame number: {} \n".format(frame_num))
 
         # Init the tracking & reconstruction method.
-        mod = models.SuPer(args.method, data_cost, depth_cost, \
-            deep_depth_cost, coord_cost, arap_cost, rot_cost, corr_cost, \
-            args.data_lambda, args.depth_lambda, args.deep_depth_lambda, \
-            args.coord_lambda, args.corr_lambda, args.arap_lambda, \
-            args.rot_lambda, evaluate_super)
+        mod = models.SuPer(args.method, \
+            data_cost, corr_cost, depth_cost, arap_cost, rot_cost, \
+            args.data_lambda, args.corr_lambda, args.depth_lambda, \
+            args.arap_lambda, args.rot_lambda, \
+            evaluate_super)
 
         if P_time:
             print("Running time (s):")
@@ -166,17 +148,12 @@ def main():
                 else:
                     if P_time: start = timeit.default_timer()
                     
-                    # Preprocessing.
-                    points, norms, isED, rad, conf, valid = depthProcessing(rgb, depth, depth_ID=depth_ID)
+                    new_data = depthProcessing(rgb, depth, time, depth_ID) # Preprocessing.
                     if P_time: depth_prepro_time = runtime_moving_average(inputs=depth_prepro_time, \
                         new_time=timeit.default_timer() - start)
                     
-                    rgb_flatten = torch.as_tensor(rgb, dtype=dtype_, device=dev).view(-1,3)
-                    
                     if init_surfels:
-
-                        allModel = mod.init_surfels(points, norms, rgb, rgb_flatten, \
-                            rad, conf, isED, valid, time, depth_ID)
+                        allModel = mod.init_surfels(new_data)
 
                         if evaluate_super:
                             allModel.init_track_pts(eva_ids, labelPts)
@@ -196,8 +173,7 @@ def main():
                             filename = os.path.join(error_folder,str(depth_ID)+".png")
                             bf_data_errors = allModel.vis_opt_error(points, norms, valid)
                         
-                        allModel, times_ = mod.fusion(allModel, points, norms, valid, \
-                            rgb_flatten, rad, conf, isED, rgb, time, depth_ID)
+                        allModel, times_ = mod.fusion(allModel, new_data)
 
                         if P_time: 
                             lm_time = runtime_moving_average(inputs=lm_time, new_time=times_[0])
@@ -242,14 +218,17 @@ def main():
                     output_lines[6] = "Iter: {}".format(depth_ID)
                     output_lines[7] = P_cond
                     if not init_surfels:
-                        output_lines[8] = "Current ED num: {}, current surfel num: {}".format(allModel.ED_num, allModel.surfel_num)
+                        output_lines[8] = "Current ED num: {}, current surfel num: {}".format(allModel.ED_nodes.num, allModel.surfel_num)
 
             # TODO
             # print("Finish tracking, close the window.")
             # if visualize and open3d_visualize:
             #         vis.destroy_window()
 
-            os.rename(output_folder, output_folder+"_"+out_filename)
+            new_output_folder = output_folder+"_"+out_filename
+            if os.path.exists(new_output_folder):
+                shutil.rmtree(new_output_folder)
+            os.rename(output_folder, new_output_folder)
             
             if evaluate_super:
                 track_rsts = np.stack(allModel.track_rsts,axis=0)
@@ -260,9 +239,9 @@ def main():
 
         # Init models.
         mod = models.DeepSuPer(args.method, args.phase, data_cost, depth_cost, \
-            deep_depth_cost, coord_cost, arap_cost, rot_cost, corr_cost, \
-            args.data_lambda, args.depth_lambda, args.deep_depth_lambda, \
-            args.coord_lambda, args.corr_lambda, args.arap_lambda, \
+            arap_cost, rot_cost, corr_cost, \
+            args.data_lambda, args.depth_lambda, \
+            args.corr_lambda, args.arap_lambda, \
             args.rot_lambda, evaluate_super).cuda()
         net = mod.lm.matcher.flow_net
 

@@ -11,10 +11,10 @@ from utils.utils import *
 from models.loss import *
 
 class LM_Solver():
-    def __init__(self, method, data_cost, depth_cost, \
-        deep_depth_cost, coord_cost, arap_cost, rot_cost, corr_cost, \
-        data_lambda, depth_lambda, deep_depth_lambda, coord_lambda, \
-        corr_lambda, arap_lambda, rot_lambda, phase="test"):
+    def __init__(self, method, \
+        data_cost, corr_cost, depth_cost, arap_cost, rot_cost, \
+        data_lambda, corr_lambda, depth_lambda, arap_lambda, rot_lambda, \
+        phase="test"):
         
         self.losses = []
         self.lambdas = []
@@ -22,7 +22,7 @@ class LM_Solver():
             self.losses.append(DataLoss())
             self.lambdas.append(data_lambda)
         if depth_cost:
-            self.losses.append(DepthLoss())
+            self.losses.append(FeatLoss(use_point=True))
             self.lambdas.append(depth_lambda)
         if arap_cost:
             self.losses.append(ARAPLoss())
@@ -31,17 +31,8 @@ class LM_Solver():
             self.losses.append(RotLoss())
             self.lambdas.append(rot_lambda)
         if corr_cost:
-            self.losses.append(CorrLoss())
+            self.losses.append(CorrLoss(point_loss=True))
             self.lambdas.append(corr_lambda)
-        if coord_cost:
-            self.losses.append(CoordLoss())
-            self.lambdas.append(coord_lambda)
-        
-        # if corr_cost or coord_cost:
-        #     if method == 'super': 
-        #         self.matcher = img_matching.cv2Matcher()
-        #     elif method == 'dlsuper': 
-        #         self.matcher = img_matching.DeepMatcher(phase)
 
         self.phase = phase
         self.beta_init = torch.tensor([[1.,0.,0.,0.,0.,0.,0.]], dtype=fl64_, device=dev)
@@ -67,9 +58,9 @@ class LM_Solver():
     def prepareCostTerm(self, sfModel, new_data, beta, grad=False):
 
         if grad:
-            jtj = torch.zeros((sfModel.param_num, sfModel.param_num), \
+            jtj = torch.zeros((sfModel.ED_nodes.param_num, sfModel.ED_nodes.param_num), \
                 layout=torch.sparse_coo, dtype=fl32_, device=dev)
-            jtl = torch.zeros((sfModel.param_num, 1), dtype=fl32_, device=dev)
+            jtl = torch.zeros((sfModel.ED_nodes.param_num, 1), dtype=fl32_, device=dev)
         
             for loss_term, lambda_ in zip(self.losses, self.lambdas):
                 jtj_, jtl_ = loss_term.forward(lambda_, beta, new_data, grad=True)
@@ -94,11 +85,11 @@ class LM_Solver():
     def LM(self, sfModel, new_data, u = 50., v = 7.5, minimal_loss = 1e10, num_Iter=10):
 
         # Init quaternion and translation parameters.
-        best_beta = self.beta_init.repeat(sfModel.ED_num,1)
+        best_beta = self.beta_init.repeat(sfModel.ED_nodes.num,1)
         beta = copy.deepcopy(best_beta)
 
-        jtj_diag_i = torch.arange(sfModel.param_num, device=dev)
-        for loss_term in self.losses: loss_term.prepare(sfModel)
+        jtj_diag_i = torch.arange(sfModel.ED_nodes.param_num, device=dev)
+        for loss_term in self.losses: loss_term.prepare(sfModel, new_data)
         for i in range(num_Iter):
 
             if debug_mode: # TODO

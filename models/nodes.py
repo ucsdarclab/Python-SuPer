@@ -1,7 +1,6 @@
 import open3d as o3d
-# from sklearn.neighbors import NearestNeighbors
 import torch
-# import copy
+from torch_geometric.data import Data
 import cv2
 
 from utils.config import *
@@ -10,23 +9,24 @@ from utils.renderer import *
 
 class Surfels():
 
-    def __init__(self, points, norms, colors, rad, conf, isED, valid, rgb, time, ID):
+    def __init__(self, new_data):
+
+        self.valid = new_data.valid
 
         # Init surfels.
-        self.points = points
-        self.norms = norms
-        self.colors = colors
+        self.points = new_data.points[self.valid]
+        self.norms = new_data.norms[self.valid]
+        self.colors = new_data.colors[self.valid]
         if qual_color_eval:
             self.eval_colors = init_qual_color(self.points)
-        self.rad = rad
-        self.conf = conf
-        self.surfel_num = len(points)
-        self.time_stamp = time * torch.ones(self.surfel_num, device=dev)
+        self.rad = new_data.rad[self.valid]
+        self.conf = new_data.conf[self.valid]
+        self.surfel_num = len(self.points)
+        self.time_stamp = new_data.time * torch.ones(self.surfel_num, device=dev)
 
         self.evaluate_super = False
 
-        self.valid = valid
-        self.validmap = valid.view(HEIGHT,WIDTH)
+        self.validmap = self.valid.view(HEIGHT,WIDTH)
         valid_indexs = torch.arange(self.surfel_num, dtype=int, device=dev).unsqueeze(1)
         valid_coords = self.validmap.nonzero()
         # Column direction of self.projdata:
@@ -35,12 +35,11 @@ class Surfels():
         self.projdata = torch.cat([valid_indexs,valid_coords], dim=1).type(tfdtype_)
 
         # init ED nodes
-        self.get_ED(isED, init=True)
-
-        self.param_num = self.ED_num * 7
+        isED = new_data.isED[self.valid]
+        self.update_ED(points=self.points[isED], norms=self.norms[isED], init=True)
 
         # self.rgb = rgb
-        self.ID = ID
+        self.ID = new_data.ID
         
         # TODO
         # if open3d_visualize:
@@ -49,23 +48,55 @@ class Surfels():
         #     self.get_o3d_pcd(init=True)
         # self.get_o3d_pcd(init=True)
 
-        # Init renderer. Options: Projector(), Pulsar()
-        self.renderer = Pulsar()
+        # Init renderer.
+        if render_method == 'proj': self.renderer = Projector()
+        elif render_method == 'pulsar': self.renderer = Pulsar()
     
     # Init/update ED nodes & ED nodes related parameters. TODO
-    def get_ED(self, isED, init=False, points=None):
+    def update_ED(self, points=None, norms=None, init=False):
         
+        ## Grid Sample
         if init:
-            self.ED_points = self.points[isED]
-            # self.ED_colors = self.colors[isED]
-            self.ED_norms = self.norms[isED]
-            # self.ED_rad = self.rad[isED]
-            # self.ED_conf = self.conf[isED]
+            if ED_sample_method == 'uniform':
+                points, ED_indices = find_ED_nodes(points)
+                norms = norms[ED_indices]
 
-            self.update_KNN()
+            num = len(points)
+            self.ED_nodes = Data(points=points, norms=norms, \
+                colors=init_qual_color(points, margin=50.), \
+                num=num, param_num=num*7)
 
-        else:
-            self.ED_points = torch.cat([self.ED_points,points[isED]], dim=0)
+            # Find 8 neighbors of ED nodes.
+            _, self.ED_knn_indices, _ = update_KNN_weights(points=points, \
+                targets=points, n_neighbors_=ED_n_neighbors)
+
+            self.sf_knn_weights, self.sf_knn_indices, self.sf_knn_div_indices = \
+                update_KNN_weights(points=self.points, targets=points, n_neighbors_=n_neighbors)
+
+        elif points is not None:
+            if ED_sample_method == 'grid':
+                self.ED_nodes.points = torch.cat([self.ED_nodes.points, points], dim=0)
+                self.ED_nodes.norms = torch.cat([self.ED_nodes.norms, norms], dim=0)
+                self.ED_nodes.colors = torch.cat([self.ED_nodes.colors, \
+                    255 * torch.ones((len(points), 3), device=dev)], dim=0)
+
+            elif ED_sample_method == 'uniform':
+                self.ED_nodes.points, new_indices = find_ED_nodes(points, EDs=self.ED_nodes.points)
+                points = self.ED_nodes.points[self.ED_nodes.num:]
+                if len(new_indices) > 0:
+                    self.ED_nodes.norms = torch.cat([self.ED_nodes.norms, norms[new_indices]], dim=0)
+                    self.ED_nodes.colors = torch.cat([self.ED_nodes.colors, \
+                        255 * torch.ones((len(new_indices), 3), device=dev)], dim=0)
+
+            self.ED_nodes.num = len(self.ED_nodes.points)
+            self.ED_nodes.param_num = self.ED_nodes.num*7
+
+            # Add 8 neighbors of new ED nodes.
+            _, new_ED_knn_indices, _ = update_KNN_weights(points=points, \
+                targets=self.ED_nodes.points, n_neighbors_=ED_n_neighbors)
+            self.ED_knn_indices = torch.cat([self.ED_knn_indices, new_ED_knn_indices], dim=0)
+            
+        self.ED_knn_indices = self.ED_knn_indices.contiguous()
 
     # If evaluate on the SuPer dataset, init self.label_index which includes
     # the indicies of the tracked points.
@@ -97,17 +128,6 @@ class Surfels():
                 filename = os.path.join(F_super_track,str(evaluate_id+1)+".jpg")
                 vis_track_rst(labelPts, self.track_rsts[-1], evaluate_id, rgb, filename)
 
-    # TODO
-    def update_KNN(self):
-
-            # finding the 8 neighbour for ED nodes
-            self.ednode_knn_indexs, _ = self.findKNN(self.ED_points, n_neighbors=ED_n_neighbors, isSurfel=False)
-
-            # finding the 4NN ED nodes for every surfel in new index
-            self.surfel_knn_indexs, self.surfel_knn_weights, _ = self.findKNN(self.points)
-
-            self.ED_num = len(self.ED_points)
-
     # Init/update open3d data for display. TODO
     def get_o3d_pcd(self, init=False):
 
@@ -128,19 +148,18 @@ class Surfels():
 
     # Update surfels and ED nodes with their motions estimated by optimizor.
     def update(self, deform):
-
-        sf_knn = self.ED_points[self.surfel_knn_indexs] # All g_i in (10).
+        sf_knn = self.ED_nodes.points[self.sf_knn_indices] # All g_i in (10).
         sf_diff = self.points.unsqueeze(1) - sf_knn
-        deform_ = deform[self.surfel_knn_indexs]
-        self.points, _ = Trans_points(sf_diff, sf_knn, deform_, self.surfel_knn_weights)
+        deform_ = deform[self.sf_knn_indices]
+        self.points, _ = Trans_points(sf_diff, sf_knn, deform_, self.sf_knn_weights)
 
         norms, _ = transformQuatT(self.norms.unsqueeze(1).repeat(1,n_neighbors,1), \
             deform_[...,0:4])
-        norms = torch.sum(self.surfel_knn_weights.unsqueeze(-1) * norms, dim=-2)
+        norms = torch.sum(self.sf_knn_weights.unsqueeze(-1) * norms, dim=-2)
         self.norms = torch.nn.functional.normalize(norms, dim=-1)
         
-        self.ED_points += deform[:,4:]
-        # self.ED_norms, _ = transformQuatT(self.ED_norms, deform[...,0:4]) # TODO
+        self.ED_nodes.points += deform[:,4:]
+        self.ED_nodes.norms, _ = transformQuatT(self.ED_nodes.norms, deform[...,0:4])
 
     # Delete unstable surfels & ED nodes.
     def prepareStableIndexNSwapAllModel(self, time, ID, init=False):
@@ -158,10 +177,10 @@ class Surfels():
         self.rad = self.rad[isStable]
         self.time_stamp = self.time_stamp[isStable]
         self.surfel_num = len(self.points)
-        self.param_num = self.ED_num * 7
 
-        self.surfel_knn_indexs = self.surfel_knn_indexs[isStable]
-        self.surfel_knn_weights = self.surfel_knn_weights[isStable]
+        self.sf_knn_indices = self.sf_knn_indices[isStable]
+        self.sf_knn_div_indices = self.sf_knn_div_indices[isStable]
+        self.sf_knn_weights = self.sf_knn_weights[isStable]
 
         if not init:
             if self.evaluate_super:
@@ -184,8 +203,18 @@ class Surfels():
         self.validRender = torch.mean(self.renderImg.view(-1,3), axis=1) > 10 # TODO: Better valid map.
         self.validRender &= self.valid
         if save_render_img:
+            out = torch_to_numpy(self.renderImg)
+            if vis_ED_nodes:
+                if render_method == 'proj':
+                    ED_img = torch_to_numpy(self.renderer.forward(self.ED_nodes))
+                elif render_method == 'pulsar':
+                    ED_img = torch_to_numpy(self.renderer.forward(self.ED_nodes, rad=0.04))
+                valid_ED_img = ED_img[:,:,0] > 10
+                out[cv2.dilate(valid_ED_img.astype('uint8'), \
+                    np.ones((3, 3), 'uint8'), iterations=1) > 0] = 255
+                out[valid_ED_img] = ED_img[valid_ED_img]
             cv2.imwrite(os.path.join(F_render_img, "{:06d}.png".format(ID)), \
-                torch_to_numpy(self.renderImg)[:,:,::-1])
+                out[:,:,::-1])
 
         # Save the cont. color image for qualitative evaluation.
         if qual_color_eval:
@@ -193,21 +222,16 @@ class Surfels():
                 torch_to_numpy(self.renderer.forward(self, qual_color=True))[:,:,::-1])
 
     # Fuse the input data into our reference model.
-    def fuseInputData(self, new_data, ID):
+    # def fuseInputData(self, new_data, ID):
+    def fuseInputData(self, new_data):
 
         # Return data[indices]. 'indices' can be either indices or True/False map.
         def get_data(indices, data):
-            if data is None:
-                return self.points[indices], self.norms[indices], self.colors[indices], \
-                self.rad[indices], self.conf[indices]
-            else:
-                points, norms, colors, rad, conf = data
-                return points[indices], norms[indices], colors[indices], \
-                    rad[indices], conf[indices]
+            return data.points[indices], data.norms[indices], data.colors[indices], \
+                data.rad[indices], data.conf[indices]
 
         # Merge data1 & data2, and update self.data[indices].
-        def merge_data(indices1, indices2, time, data1=None, data2=None):
-
+        def merge_data(data1, indices1, data2, indices2, time):
             p, n, c, r, w = get_data(indices1, data1)
             p_new, n_new, c_new, r_new, w_new = get_data(indices2, data2)
 
@@ -238,7 +262,8 @@ class Surfels():
 
             return valid
 
-        points, norms, valid, colors, rad, conf, isED, time = new_data
+        valid = new_data.valid
+        time = new_data.time
 
         ## Project surfels onto the image plane. For each pixel, only up to 16 projections with higher confidence.
         # Ignore surfels that have projections outside the image.
@@ -278,8 +303,7 @@ class Surfels():
 
             val_ = valid & val_map
             index_ = index_map[val_]
-            merge_val_ = merge_data(index_, val_, time, \
-                data2=[points, norms, colors, rad, conf])
+            merge_val_ = merge_data(self, index_, new_data, val_, time)
             valid[val_] = ~merge_val_
         add_valid |= valid
 
@@ -294,7 +318,7 @@ class Surfels():
 
                 indices1 = index_maps[i][val_]
                 indices2 = index_maps[j][val_]
-                merge_val_ = merge_data(indices1, indices2, time)
+                merge_val_ = merge_data(self, indices1, self, indices2, time)
                 val_maps[j][val_] = ~merge_val_
                 
                 indices2 = indices2[merge_val_]
@@ -329,66 +353,46 @@ class Surfels():
             self.time_stamp = torch_delete(self.time_stamp, del_indices)
 
             self.surfel_num = len(self.points)
+
+            self.sf_knn_indices = torch_delete(self.sf_knn_indices, del_indices)
+            self.sf_knn_div_indices = torch_delete(self.sf_knn_div_indices, del_indices)
+            self.sf_knn_weights = torch_delete(self.sf_knn_weights, del_indices)
         
         ## Add points that do not have corresponding surfels.
         new_point_num = torch.count_nonzero(add_valid)
         if new_point_num > 0:
-            new_points = points[add_valid]
-            self.points = torch.cat([self.points, points[add_valid]], dim=0)
-            self.norms = torch.cat([self.norms, norms[add_valid]], dim=0)
-            self.colors = torch.cat([self.colors, colors[add_valid]], dim=0)
+            ## Update the knn weights of existing surfels.
+            sf_knn_dists = torch_distance(self.points.unsqueeze(1), \
+                self.ED_nodes.points[self.sf_knn_indices])
+            self.sf_knn_weights = update_KNN_weights(dists=torch.cat([sf_knn_dists, \
+                torch_distance(self.points, self.ED_nodes.points[self.sf_knn_div_indices], keepdim=True)], \
+                dim=1))
+
+            new_points = new_data.points[add_valid]
+            self.points = torch.cat([self.points, new_points], dim=0)
+            new_norms = new_data.norms[add_valid]
+            self.norms = torch.cat([self.norms, new_norms], dim=0)
+            
+            self.colors = torch.cat([self.colors, new_data.colors[add_valid]], dim=0)
             if qual_color_eval:
                 new_eval_colors = float('nan')*torch.ones((new_point_num,3), device=dev)
                 self.eval_colors = torch.cat([self.eval_colors, new_eval_colors], dim=0)
-            self.rad = torch.cat([self.rad, rad[add_valid]])
-            self.conf = torch.cat([self.conf, conf[add_valid]])
+            self.rad = torch.cat([self.rad, new_data.rad[add_valid]])
+            self.conf = torch.cat([self.conf, new_data.conf[add_valid]])
             self.time_stamp = torch.cat([self.time_stamp, \
                 time*torch.ones(new_point_num, device=dev)])
             self.surfel_num += new_point_num
             
-            # Update isED: Only points that are far enough from 
-            # existing ED nodes can be added as new ED nodes. 
-            # TODO: Better ways?
-            _, _, new_knn_dists = self.findKNN(new_points)
-            isED = isED[add_valid] & (new_knn_dists[:,0] > UPPER_ED_DISTANCE)
-            self.get_ED(isED, points=new_points)
-
-        # TODO: Better ways?
-        ## Delete ED nodes that are too close to each other.
-        SFknn_idxs, _, _ = self.findKNN(self.points)
-        _, node_count = torch.unique( torch.cat([SFknn_idxs.flatten(), \
-            torch.arange(len(self.ED_points), device=dev)]), \
-            sorted=True, return_counts=True)
-        bad_idxs = node_count < CLS_SIZE_TH
-        # Find the 8 neighbour for ED nodes.
-        ednode_knn_indexs, ednode_knn_dists = self.findKNN(self.ED_points, \
-            n_neighbors=ED_n_neighbors, isSurfel=False)
-        m = ((ednode_knn_dists[:,0] < LOWER_ED_DISTANCE) & (~bad_idxs)).nonzero()
-        n = ednode_knn_indexs[m,0]
-        bad_idxs = torch.cat([bad_idxs.nonzero(), torch.where(node_count[m]<node_count[n],m,n)])
-        # del node_count, ednode_knn_indexs, ednode_knn_dists, m, n
-        self.ED_points = torch_delete(self.ED_points, bad_idxs)
-        self.update_KNN()
-
-    # TODO: Speed up KNN
-    def findKNN(self, surfels, n_neighbors=n_neighbors, isSurfel=True):
-
-        D = torch.cdist(surfels, self.ED_points)
-        dists, sort_idx = D.topk(k=n_neighbors+1, dim=-1, largest=False, sorted=True)
-
-        if isSurfel:
-            knn_indexs = sort_idx[:,0:n_neighbors]
-            knn_dists = dists[:,0:n_neighbors]
-
-            # TODO: Need better weight calculation method.
-            knn_weights = 1. - knn_dists / (dists[:,-1].view(-1,1)+1e-8)
-            knn_weights *= knn_weights
-            
-            # Normalize the weights.
-            # knn_weights *= self.ED_conf[knn_indexs]
-            knn_weights = torch.nn.functional.softmax(knn_weights, dim=1)
-
-            return knn_indexs, knn_weights, knn_dists
-        
-        else:
-            return sort_idx[:, 1:].contiguous(), dists[:, 1:]
+            ## Update isED: Only points that are far enough from 
+            ## existing ED nodes can be added as new ED nodes.
+            D = torch.cdist(new_points, self.ED_nodes.points)
+            new_knn_dists, _ = D.topk(k=1, dim=-1, largest=False, sorted=True)
+            isED = new_data.isED[add_valid] & (new_knn_dists[:,-1] > torch.max(sf_knn_dists))
+            self.update_ED(points=new_points[isED], norms=new_norms[isED])
+            # Add the knn weights of new surfels.
+            new_sf_knn_weights, new_sf_knn_indices, new_sf_knn_div_indices = \
+                update_KNN_weights(points=new_points, targets=self.ED_nodes.points, \
+                n_neighbors_=n_neighbors)
+            self.sf_knn_weights = torch.cat([self.sf_knn_weights, new_sf_knn_weights], dim=0)
+            self.sf_knn_indices = torch.cat([self.sf_knn_indices, new_sf_knn_indices], dim=0)
+            self.sf_knn_div_indices = torch.cat([self.sf_knn_div_indices, new_sf_knn_div_indices])
