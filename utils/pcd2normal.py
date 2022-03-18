@@ -29,27 +29,25 @@ class CentralDiff(nn.Module):
             
             return out_N, torch.isnan(out_N[:,:,0])
         
-        Z = cv2.bilateralFilter(Z,15,80,80)
+        # Z = cv2.bilateralFilter(Z,15,80,80)
         ZF = cv2.bilateralFilter(Z,15,80,80)
         
         X, Y, Z = depth2pcd(numpy_to_torch(Z))
-        points = torch.stack([X,Y,Z], dim=-1)
+        points = torch.stack([X,-Y,-Z], dim=-1)
         norms, invalid = getN(points)
 
         # Ref[1]-"A copy of the depth map (and hence associated vertices and normals) are also 
         # denoised using a bilateral filter (for camera pose estimation later)."
         XF, YF, ZF = depth2pcd(numpy_to_torch(ZF))
-        pointsF = torch.stack([XF,YF,ZF], dim=-1)
+        pointsF = torch.stack([XF,-YF,-ZF], dim=-1)
         normsF, invalidF = getN(pointsF)
 
         # Update the valid map.
         norm_angs = torch_inner_prod(norms, normsF)
         pt_dists = torch_distance(points, pointsF)
-        invalid = (torch.abs(Z) < 1.0) | (torch.abs(Z) > 10.0) | invalid | invalidF | \
+        invalid = (Z < 1.0) | (Z > 10.0) | invalid | invalidF | \
             (norm_angs < THRESHOLD_COSINE_ANGLE) | (pt_dists > THRESHOLD_DISTANCE)
 
-        points[invalid] = float('nan')
-        norms[invalid] = float('nan')
         return points, norms, invalid
 
 # Code copied from https://github.com/Charmve/SNE-RoadSeg2, ./models/sne_model.py
@@ -65,9 +63,7 @@ class SNE(nn.Module):
         h,w = HEIGHT, WIDTH
         Z = cv2.bilateralFilter(Z,15,80,80)
         X, Y, Z = depth2pcd(numpy_to_torch(Z))
-        points = torch.stack([X,Y,Z], dim=-1)
-        Y = -Y
-        Z = -Z
+        points = torch.stack([X,-Y,-Z], dim=-1)
         
         invalid = torch.isnan(Z)
         Z[invalid] = 0
@@ -133,8 +129,8 @@ class SNE(nn.Module):
 
         invalid = invalid | torch.isnan(nz) | (torch.abs(Z) < 1.0) | (torch.abs(Z) > 10.0)
         norms = torch.stack([nx, -ny, -nz], dim=-1)
-        points[invalid] = float('nan')
-        norms[invalid] = float('nan')
+        # points[invalid] = float('nan')
+        # norms[invalid] = float('nan')
 
         # Left-hand ---> Right-hand
         return points, norms, invalid

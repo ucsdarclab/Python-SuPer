@@ -9,12 +9,6 @@ import cv2
 
 from utils.config import *
 
-# Convert depth map to point cloud.
-def depth2pcd(Z):
-    X = (U - cx) * Z / fx
-    Y = (V - cy) * Z / fy
-    return X, -Y, -Z
-
 # Input (n_samples, n_features)
 # Output: Normalize each sample
 def normalization(inputs):
@@ -25,17 +19,17 @@ def normalization(inputs):
 
     return np.reshape(inputs_norm, inputs_shape)
 
-# Find n_neighbors of inputs in targets
-def KNN(inputs, targets, n_neighbors=4):
+# # Find n_neighbors of inputs in targets
+# def KNN(inputs, targets, n_neighbors=4):
 
-    nbrs = NearestNeighbors(n_neighbors=n_neighbors, algorithm='ball_tree').fit(targets)
-    weights, indexs = nbrs.kneighbors(inputs)
+#     nbrs = NearestNeighbors(n_neighbors=n_neighbors, algorithm='ball_tree').fit(targets)
+#     weights, indexs = nbrs.kneighbors(inputs)
 
-    if n_neighbors == 1:
-        weights = np.squeeze(weights)
-        indexs = np.squeeze(indexs)
+#     if n_neighbors == 1:
+#         weights = np.squeeze(weights)
+#         indexs = np.squeeze(indexs)
 
-    return weights, indexs
+#     return weights, indexs
 
 # Inner product
 def inner_prod(a,b):
@@ -80,9 +74,9 @@ def put_text(image, text):
     return image
 
 def name_file(method, data_cost, depth_cost, arap_cost, \
-    rot_cost, corr_cost, coord_cost, \
+    rot_cost, corr_cost, \
     data_lambda, depth_lambda, arap_lambda, rot_lambda, \
-    corr_lambda, coord_lambda, \
+    corr_lambda, \
     use_lambda=False):
 
     def str_lambda(lambda_):
@@ -98,7 +92,6 @@ def name_file(method, data_cost, depth_cost, arap_cost, \
         if arap_cost: filename += "_"+str_lambda(arap_lambda)+"ARAP"
         if rot_cost: filename += "_"+str_lambda(rot_lambda)+"rot"
         if corr_cost: filename += "_"+str_lambda(corr_lambda)+"corr"
-        if coord_cost: filename += "_"+str_lambda(coord_lambda)+"coord"
 
     else:
         if data_cost: filename += "_data"
@@ -106,7 +99,6 @@ def name_file(method, data_cost, depth_cost, arap_cost, \
         if arap_cost: filename += "_ARAP"
         if rot_cost: filename += "_rot"
         if corr_cost: filename += "_corr"
-        if coord_cost: filename += "_coord"
 
     return filename
 
@@ -230,8 +222,8 @@ def torch_delete(inputs, indexs):
     return inputs[mask]
 
 # Distance
-def torch_distance(a,b):
-    return torch.linalg.norm(a-b, dim=-1)
+def torch_distance(a,b,keepdim=False):
+    return torch.linalg.norm(a-b, dim=-1, keepdim=keepdim)
 
 # Inner product
 def torch_inner_prod(a,b):
@@ -259,7 +251,6 @@ def pcd2depth(pcd, round_coords=True, depth_sort=False, conf_sort=False, conf=No
     u = torch.round(u_).long()
     v = torch.round(v_).long()
     coords = v * WIDTH + u
-    # coords = coords.long()
     valid_proj = (u>=0) & (u<WIDTH) & (v>=0) & (v<HEIGHT)
 
     if depth_sort or conf_sort:
@@ -354,13 +345,12 @@ def vis_norm_map(norms, valid, filename, coords=None):
 
 # Assign a color to each point in a point cloud to visualize the
 # deformation tracking results for qualitative evaluation.
-def init_qual_color(points):
+def init_qual_color(points, margin=0.):
     # 'points' should be a Nx3 torch tensor
     
     max_dist, _ = torch.max(points, dim = 0, keepdim=True)
     min_dist, _ = torch.min(points, dim = 0, keepdim=True)
 
-    margin = 0.
     return (255. - margin * 2) * (max_dist - points) / (max_dist - min_dist) + margin
 
 # Save frames with SuPer 20-point tracking results.
@@ -462,3 +452,57 @@ def transformQuatT(v, beta, grad=False, skew_v=None):
         return tv, torch.cat([d_qw, d_qv], dim=-1)
     else:
         return tv, 0
+
+# Uniform Sampling
+# Ref: Embedded Deformation for Shape Manipulation
+# Inputs: 'cands': candidate points, 'EDs': existed ednodes.
+def find_ED_nodes(cands, EDs=None):
+    # Remove all candidates that are within the given radius.
+    def update_cands(cands, cand_indices, ED):
+        del_indices = (torch_distance(cands, ED) < ED_rad).nonzero(as_tuple=True)[0]
+        cands = torch_delete(cands, del_indices)
+        cand_indices = torch_delete(cand_indices, del_indices)
+        return cands, cand_indices
+
+    cand_indices = torch.arange(len(cands))
+
+    if EDs is not None:
+        for ED in EDs:
+            cands, cand_indices = update_cands(cands, cand_indices, ED)
+    
+    ED_indices = []
+    while len(cands) > 0:
+        # Randomly select a new ED node and add it to 'EDs'.
+        new_ED_index = torch.randint(len(cands), (1,))
+        new_ED = cands[new_ED_index]
+        if EDs is None:
+            EDs = new_ED
+        else:
+            EDs = torch.cat([EDs, new_ED], dim=0)
+        ED_indices.append(cand_indices[new_ED_index])
+        
+        # Remove all candidates that are within the given radius.
+        cands, cand_indices = update_cands(cands, cand_indices, new_ED)
+
+    if len(ED_indices) > 0:
+        ED_indices = torch.cat(ED_indices)
+    return EDs, ED_indices
+
+def update_KNN_weights(points=None, targets=None, n_neighbors_=None, dists=None):
+    def dist2weight(dists):
+        weights = 1. - dists[:,:-1] / (dists[:,-1].unsqueeze(1)+1e-8)
+        return torch.nn.functional.softmax(weights**1, dim=1)
+
+    if dists is None:
+        D = torch.cdist(points, targets)
+        dists, sort_idx = D.topk(k=n_neighbors_+1, dim=-1, largest=False, sorted=True)
+        return dist2weight(dists), sort_idx[:,:-1], sort_idx[:,-1]
+
+    else:
+        return dist2weight(dists)
+
+# Convert depth map to point cloud.
+def depth2pcd(Z):
+    X = (U - cx) * Z / fx
+    Y = (V - cy) * Z / fy
+    return X, Y, Z

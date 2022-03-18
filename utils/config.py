@@ -27,9 +27,25 @@ fx = 768.98551924
 fy = 768.98551924
 cx = 292.8861567
 cy = 291.61479526
-K = np.array([[fx,  0, cx],
-                [ 0, fy, cy],
-                [ 0,  0,  1]])# Camera intrinsic matrix
+# K = np.array([[fx,  0, cx],
+#                 [ 0, fy, cy],
+#                 [ 0,  0,  1]])# Camera intrinsic matrix
+
+#############################
+
+# Configuarations.
+
+#############################
+n_neighbors = 4
+ED_n_neighbors = 8
+
+ED_sample_method = 'grid' # ED node sampling method.
+if ED_sample_method == 'uniform': ED_rad = 0.2
+
+render_method = 'pulsar' # Options: pulsar, proj
+corr_method = 'kornia' # Options: opencv, kornia (LoFTR)
+
+estimate_cam_pose = False
 
 #############################
 
@@ -51,12 +67,13 @@ if vis_depth_preprocessing:
 
 # If true, save the rendered image after each iter.
 save_render_img = True
+vis_ED_nodes = True
 if save_render_img:
     F_render_img = os.path.join(output_folder,"render_imgs")
     folders.append(F_render_img)
 
 # If true, save the image of points with continuous colors for qualitative evaluation.
-qual_color_eval = True
+qual_color_eval = False
 if qual_color_eval:
     F_qual_color_img = os.path.join(output_folder,"qual_color_imgs")
     folders.append(F_qual_color_img)
@@ -83,7 +100,7 @@ open3d_visualize = False # TODO If true, visualize using open3d. Otherwise, visu
 save_opt_rst = False # If true, save data/images of the errors before & after LM Algorithm.
 
 use_mask = False #  If true, read the segmentation mask to exclude instrument depth info from the depth map
-estimate_cam_pose = False
+
 
 
 
@@ -128,8 +145,7 @@ UPPER_ED_DISTANCE = 0.30 # Threshold (30mm) for deciding if a new surfel should 
 LOWER_ED_DISTANCE = 0.05 # Threshold (5mm) for deciding if a ED node should be deleted.
 CLS_SIZE_TH = 300
 
-n_neighbors = 4
-ED_n_neighbors = 8
+
 
 
 

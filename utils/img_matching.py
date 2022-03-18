@@ -3,6 +3,10 @@ import cv2
 from math import ceil
 import os
 
+import kornia as K
+import kornia.feature as KF
+from kornia_moons.feature import *
+
 from models import pwcnet
 from utils.config import *
 from utils.utils import *
@@ -56,21 +60,21 @@ class cv2Matcher(Matcher):
                 # Get the coordinates of the matched points.
                 (x1, y1) = kp1[m.queryIdx].pt
                 (x2, y2) = kp2[m.trainIdx].pt
-                x1 = round(x1)
-                y1 = round(y1)
-                x2 = round(x2)
-                y2 = round(y2)
 
                 # TODO: Valid map-based filtering? Better filtering?
+                x1_ = round(x1)
+                y1_ = round(y1)
+                x2_ = round(x2)
+                y2_ = round(y2)
                 # Discard matches in the invalid image regions and specular reflection areas.
-                match_region1 = img1[max(y1-5,0):min(y1+5,HEIGHT), max(x1-5,0):min(x1+5,WIDTH)]
-                match_region2 = img2[max(y2-5,0):min(y2+5,HEIGHT), max(x2-5,0):min(x2+5,WIDTH)]
-                if (match_region1>250).any() or (match_region2>250).any():
+                match_region1 = img1[max(y1_-5,0):min(y1_+5,HEIGHT), max(x1_-5,0):min(x1_+5,WIDTH)]
+                match_region2 = img2[max(y2_-5,0):min(y2_+5,HEIGHT), max(x2_-5,0):min(x2_+5,WIDTH)]
+                if (match_region1 > 250).any() or (match_region2 > 250).any():
                     continue
 
                 if vis_img_matching: filtered_good_matches.append([m])
-                matches1.append(torch.tensor([[x1,y1]], device=dev))
-                matches2.append(torch.tensor([[x2,y2]], device=dev))
+                matches1.append(torch.tensor([x1,y1], device=dev))
+                matches2.append(torch.tensor([x2,y2], device=dev))
 
                 # TODO: Remove overlap matches.
 
@@ -83,9 +87,66 @@ class cv2Matcher(Matcher):
             cv2.imwrite(os.path.join(F_img_matching,str(ID)+'.jpg'), out)
 
         if len(matches1) > 0:
-            matches1 = torch.cat(matches1, axis=0)
-            matches2 = torch.cat(matches2, axis=0)
+            matches1 = torch.stack(matches1, dim=0)
+            matches2 = torch.stack(matches2, dim=0)
         return matches1, matches2
+
+# LoFTR (https://zju3dv.github.io/loftr/) with official kornia implementation.
+class LoFTR(Matcher):
+
+    def __init__(self):
+
+        # Options: 'outdoor', 'indoor'.
+        self.matcher = KF.LoFTR(pretrained='indoor')
+    
+    def match_features(self, img1, img2, ID):
+
+        if not torch.is_tensor(img1): img1 = numpy_to_torch(img1)
+        if not torch.is_tensor(img2): img2 = numpy_to_torch(img2)
+        img1 = img1.type(fl32_).permute(2,0,1).unsqueeze(0) / 255.
+        img2 = img2.type(fl32_).permute(2,0,1).unsqueeze(0) / 255.
+        
+        # LofTR works on grayscale images only.
+        input_dict = {"image0": K.color.rgb_to_grayscale(img1.cpu()), \
+            "image1": K.color.rgb_to_grayscale(img2.cpu())}
+
+        with torch.no_grad():
+            correspondences = self.matcher(input_dict)
+
+        matches1 = correspondences['keypoints0']#.cpu().numpy()
+        matches2 = correspondences['keypoints1']#.cpu().numpy()
+
+        _, inliers = cv2.findFundamentalMat(matches1.numpy(), matches2.numpy(), \
+            cv2.USAC_MAGSAC, 0.5, 0.999, 100000)
+        inliers = inliers[:,0] > 0
+
+        if vis_img_matching:
+            fig = plt.figure()
+            ax = fig.add_subplot(1, 1, 1)
+            matches1_ = matches1[::20]
+            matches2_ = matches2[::20]
+            inliers_ = inliers[::20]
+            draw_LAF_matches(
+                KF.laf_from_center_scale_ori(matches1_.view(1,-1, 2),
+                                            torch.ones(matches1_.size()[0]).view(1,-1, 1, 1),
+                                            torch.ones(matches1_.size()[0]).view(1,-1, 1)),
+
+                KF.laf_from_center_scale_ori(matches2_.view(1,-1, 2),
+                                            torch.ones(matches2_.size()[0]).view(1,-1, 1, 1),
+                                            torch.ones(matches2_.size()[0]).view(1,-1, 1)),
+                torch.arange(matches1_.size()[0]).view(-1,1).repeat(1,2),
+                K.tensor_to_image(img1),
+                K.tensor_to_image(img2),
+                inliers_,
+                draw_dict={'inlier_color': (0.2, 1, 0.2),
+                        'tentative_color': None, 
+                        'feature_color': (0.2, 0.5, 1), 'vertical': False},
+                ax=ax,
+            )
+            plt.savefig(os.path.join(F_img_matching,str(ID)+'.jpg'))
+
+        # x, y
+        return matches1[inliers].to(dev), matches2[inliers].to(dev)
 
 class DeepMatcher():
 

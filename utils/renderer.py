@@ -8,7 +8,6 @@ from torch import nn
 from pytorch3d.renderer.points.pulsar import Renderer
 from pytorch3d.transforms import matrix_to_rotation_6d
 
-# from models.loss import *
 from utils.config import *
 from utils.utils import *
 
@@ -22,19 +21,19 @@ class Pulsar(nn.Module):
 
     def get_cam_params(self, opencv=True):
 
-        R = torch.eye(3, dtype=fl32_)
+        R = torch.eye(3, dtype=fl32_, device=dev)
         openCV2PyTorch3D_R = torch.tensor(
             [[-1.0, 0.0, 0.0],
             [0.0, -1.0, 0.0],
             [0.0,  0.0, 1.0]], 
-            dtype=fl32_)
+            dtype=fl32_, device=dev)
         if(opencv==True):
             R *= openCV2PyTorch3D_R
         
         r = matrix_to_rotation_6d(R)
-        T = torch.zeros((3,1))
+        T = torch.zeros((3,1), device=dev)
         R = torch.cat([R, T], dim=1)
-        R = torch.cat([R, torch.tensor([[0.,0.,0.,1]])], dim=0)
+        R = torch.cat([R, torch.tensor([[0.,0.,0.,1]], device=dev)], dim=0)
         focal_length = 0.01
 
         cam_params = torch.tensor([
@@ -45,10 +44,10 @@ class Pulsar(nn.Module):
             (focal_length*WIDTH)/fx,
             -math.ceil(cx - WIDTH / 2),
             -math.ceil(cy - HEIGHT / 2),
-        ], dtype=fl32_)
+        ], dtype=fl32_, device=dev)
         return cam_params
 
-    def forward(self, allModel, qual_color=False):
+    def forward(self, allModel, qual_color=False, rad=0.02):
 
         if qual_color:
             valid = ~torch.isnan(allModel.eval_colors[:,0])
@@ -63,7 +62,7 @@ class Pulsar(nn.Module):
         self.register_parameter(
             "vert_pos", 
             nn.Parameter(
-                points.float().cpu(), requires_grad=True
+                points.type(fl32_), requires_grad=True
             ),
         )
         
@@ -71,7 +70,7 @@ class Pulsar(nn.Module):
         self.register_parameter(
             "vert_col",
             nn.Parameter(
-                colors.float().cpu(), requires_grad=True
+                colors.type(fl32_), requires_grad=True
             ),
         )
 
@@ -80,7 +79,7 @@ class Pulsar(nn.Module):
             "vert_rad",
             nn.Parameter(
                 torch.ones(surfel_num, 
-                    dtype=fl32_) * 0.1, # 0.0001
+                    dtype=fl32_, device=dev) * rad,
                 requires_grad=True
             ),
         )
@@ -92,7 +91,7 @@ class Pulsar(nn.Module):
         # intersections per ray.
         renderer = Renderer(
             WIDTH, HEIGHT, surfel_num, n_track=64, right_handed_system=True
-        )
+        ).to(dev)
 
         return renderer.forward(
             self.vert_pos,
@@ -102,7 +101,7 @@ class Pulsar(nn.Module):
             self.gamma,
             15.0,
             return_forward_info=True,
-        )[0].to(device=dev)
+        )[0]
 
 # Project with rounded coordinates.
 class Projector(nn.Module):
@@ -119,7 +118,7 @@ class Projector(nn.Module):
             if qual_color:
                 out[y,x] = allModel.eval_colors[valid_indices].float()
             else:
-                out[y,x] = allModel.colors[valid_indices]
+                out[y,x] = allModel.colors[valid_indices].float()
 
         elif self.method == "opencv":
             rod, _ = cv2.Rodrigues(np.eye(3)) # [R]otation matrix.
