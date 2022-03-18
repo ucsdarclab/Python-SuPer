@@ -7,7 +7,7 @@ phase=test
 
 evaluate_super=1
 data_cost=1
-corr_cost=1
+corr_cost=0
 arap_cost=1
 rot_cost=1
 
