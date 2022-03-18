@@ -136,7 +136,7 @@ def main():
             for depth_ID in range(frame_num):
 
                 # Read depth map, color image, & instance segmentation mask.
-                rgb, depth = read_imgs(data_dir, depth_ID, img_format, use_mask=use_mask)
+                rgb, depth = read_imgs(data_dir, depth_ID, img_format)
                 if rgb is None or depth is None:
                     time += 1.
                     P_cond = "Faild to read images, move to the next iteration."
@@ -284,18 +284,10 @@ def main():
 
                 for k, id_ in enumerate(ids):
 
-                    # Read images.
-                    if use_mask:
-                        rgb, depth, mask = read_imgs(data_dir, id_, img_format, use_mask=use_mask)
-                    else:
-                        rgb, depth = read_imgs(data_dir, id_, img_format, use_mask=use_mask)
+                    rgb, depth = read_imgs(data_dir, id_, img_format)
 
                     # Preprocessing.
-                    if use_mask:
-                        points, norms, isED, rad, conf, valid = depthProcessing(rgb, depth, maks=mask)
-                    else:
-                        points, norms, isED, rad, conf, valid = depthProcessing(rgb, depth)
-                    rgb_flatten = torch.as_tensor(rgb, dtype=tfdtype_, device=dev).view(-1,3)
+                    new_data = depthProcessing(rgb, depth, time, depth_ID)
 
                     if k == 0:
                         allModel, init_surfels = mod.init_surfels(points, norms, rgb, \
