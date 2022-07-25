@@ -8,7 +8,7 @@ import copy
 
 from utils.config import *
 from utils.utils import *
-from models.loss import *
+from super.loss import *
 
 class LM_Solver():
     def __init__(self, method, \
@@ -36,6 +36,7 @@ class LM_Solver():
 
         self.phase = phase
         self.beta_init = torch.tensor([[1.,0.,0.,0.,0.,0.,0.]], dtype=fl64_, device=dev)
+        # self.beta_init = torch.tensor([[1.,0.,0.,0.,0.,0.,0.]], dtype=fl32_, device=dev)
 
     # Solvers.
     @staticmethod
@@ -126,4 +127,4 @@ class LM_Solver():
                     stop_ = timeit.default_timer()
                     print("***Debug*** Iter: {}; time: {}s; loss: {}".format(i,np.round(stop_-start_,3),loss) )
 
-        return beta
+        return beta#.type(fl32_)

@@ -1,23 +1,124 @@
 from abc import ABC, abstractmethod
 
-from token import DEDENT
-import numpy as np
-import torch
-import copy
-import os
-
-from typeguard import check_argument_types, check_return_type
-
-from utils.config import *
 from utils.utils import *
-from utils.img_matching import *
-from models.LM import *
+from super.utils import *
+
+# TODO Allow batch.
+def bilinear_sample(inputs, v, u, index_map=None, fill='zero', grad=False, normalizations=None):
+    """
+    Given inputs (a list of feature maps) and target pixel locations (v, u) in the 
+    feature maps, computes the output features through bilinear interpolation.
+
+    * 'inputs': a list of features, each has size (N,channel,).
+    * 'index_map': If not None, its size should be (HEIGHT, WIDTH), each non-negative 
+    element indicates the location of the correponding feature vector. 
+    * 'normalizations': A list of True/False to decide if the corresponding output 
+    features will be normalized.
+    """
+    def list_normalization(xs, gradients=None):
+        if normalizations is None: return xs, gradients
+
+        for i, normalization in enumerate(normalizations):
+            if normalization:
+                scale = torch.norm(xs[i], dim=-1, keepdim=True) #(in_size,1,)
+                xs[i] /= scale
+
+                if gradients is not None:
+                    gradients[i] /= scale.unsqueeze(-1)
+
+        if gradients is None: return xs
+        else: return xs, gradients
+
+    inputs_channels = [input_.size()[-1] for input_ in inputs]
+    features = torch.cat(inputs, dim=-1)
+
+    fl_v = torch.floor(v)
+    cel_v = torch.ceil(v)
+    fl_u = torch.floor(u)
+    cel_u = torch.ceil(u)
+
+    n_block = torch.stack([fl_v, fl_v, cel_v, cel_v], dim=-1) # y: (in_size,4,)
+    m_block = torch.stack([fl_u, cel_u, fl_u, cel_u], dim=-1) # x
+    
+    # U_nm: (in_size,4,cat_input_channel,)
+    if index_map is None:
+        # U_nm = features[n_block.long()*WIDTH+m_block.long()]
+        U_nm = features[n_block.long(), m_block.long()]
+    else:
+        if fill == 'zero':
+            U_nm = torch.zeros(n_block.size()+(features.size()[-1],), 
+            device=dev).type(features.type())
+        elif fill == 'nan':
+            U_nm = torch_nans(n_block.size()+(features.size()[-1],), dtype=features.type())
+        
+        U_nm_index_map = index_map[n_block.long(), m_block.long()]
+        U_nm_valid = U_nm_index_map>=0
+        U_nm[U_nm_valid] = features[U_nm_index_map[U_nm_valid]]
+    
+    n_block -= v.unsqueeze(-1)
+    m_block -= u.unsqueeze(-1)
+    n_block = n_block.unsqueeze(-1) # Change dim to (in_size,4,1,)
+    m_block = m_block.unsqueeze(-1)
+    if grad:
+        d_n_block = torch.where(n_block >= 0, 1., -1.)
+        d_m_block = torch.where(m_block >= 0, 1., -1.)
+    n_block = torch.maximum(1-torch.abs(n_block), torch.tensor(0, device=dev))
+    m_block = torch.maximum(1-torch.abs(m_block), torch.tensor(0, device=dev))
+
+    outputs = torch.sum(U_nm * n_block * m_block, dim=-2) #(in_size,feature_channel,)
+    outputs = torch.split(outputs, inputs_channels, dim=-1)
+
+    if normalizations is not None:
+        norms_scales = []
+        for i, normalization in enumerate(normalizations):
+            if normalization:
+                norm_scale = torch.norm(outputs[i], dim=-1, keepdim=True) #(in_size,1,)
+                outputs[i] /= norms_scale
+            else:
+                norm_scale
+
+    if index_map is None:
+        U_nm_valid = None
+    else:
+        U_nm_valid = U_nm_valid.view(len(U_nm_valid), -1)
+        U_nm_valid = ~torch.any(~U_nm_valid, dim=-1)
+
+    if grad:
+        gradients = torch.stack([\
+            torch.sum(U_nm * n_block * d_m_block, dim=1, dtype=dtype_),\
+            torch.sum(U_nm * m_block * d_n_block, dim=1, dtype=dtype_)],\
+            dim=2) # dOut-dv & dOut-du: (in_size,feature_channel,2)
+        gradients = torch.split(gradients, inputs_channels, dim=-2)
+
+        if normalizations is not None:
+            outputs, gradients = list_normalization(outputs, gradients=gradients)
+        return outputs, gradients, U_nm_valid
+        
+    else:
+        if normalizations is not None:
+            list_normalization(outputs)
+        return outputs, None, U_nm_valid
+
+
+def neighbor_sample(inputs, v, u):
+    inputs_channels = [input_.size()[-1] for input_ in inputs]
+    features = torch.cat(inputs, dim=-1)
+
+    fl_v = torch.floor(v)
+    cel_v = torch.ceil(v)
+    fl_u = torch.floor(u)
+    cel_u = torch.ceil(u)
+
+    n_block = torch.stack([fl_v, fl_v, cel_v, cel_v], dim=0) # y: (4,in_size,)
+    m_block = torch.stack([fl_u, cel_u, fl_u, cel_u], dim=0) # x
+
+    outputs = features[n_block.long(), m_block.long()]
+    return torch.split(outputs, inputs_channels, dim=-1)
 
 class LossTool():
 
     @staticmethod
-    def bilinear_intrpl_block(v, u, target_, grad=False, normalization=False):
-
+    def bilinear_intrpl_block(v, u, target_, index_map=None, grad=False, normalization=False):
         fl_v = torch.floor(v)
         cel_v = torch.ceil(v)
         fl_u = torch.floor(u)
@@ -25,12 +126,15 @@ class LossTool():
 
         n_block = torch.stack([fl_v, fl_v, cel_v, cel_v], dim=1) # y
         m_block = torch.stack([fl_u, cel_u, fl_u, cel_u],dim=1) # x
-        U_nm = target_[n_block.long()*WIDTH+m_block.long()]
+        if index_map is None:
+            U_nm = target_[n_block.long()*WIDTH+m_block.long()]
+        else:
+            U_nm = torch.ones(n_block.size()+(target_.size()[-1],), dtype=fl64_, device=dev) * float('nan')
+            U_nm_index_map = index_map[n_block.long(), m_block.long()]
+            U_nm_valid = U_nm_index_map>=0
+            U_nm[U_nm_valid] = target_[U_nm_index_map[U_nm_valid]]
         n_block -= v.unsqueeze(1)
         m_block -= u.unsqueeze(1)
-        # if len(target_.size()) == 2:
-        #     n_block = n_block.unsqueeze(2)
-        #     m_block = m_block.unsqueeze(2)
         n_block = n_block.unsqueeze(2)
         m_block = m_block.unsqueeze(2)
         if grad:
@@ -38,6 +142,11 @@ class LossTool():
             d_m_block = torch.where(m_block >= 0, 1., -1.)
         n_block = torch.maximum(1-torch.abs(n_block), torch.tensor(0, device=dev)) # TODO
         m_block = torch.maximum(1-torch.abs(m_block), torch.tensor(0, device=dev))
+        # if index_map is not None:
+        #     n_block[~U_nm_valid] = 0
+        #     n_block = 2. * n_block / torch.sum(n_block, dim=1, keepdim=True)
+        #     m_block[~U_nm_valid] = 0
+        #     m_block = 2. * m_block / torch.sum(m_block, dim=1, keepdim=True)
         target = torch.sum(U_nm * n_block * m_block, dim=1, dtype=dtype_)
         if normalization:
             norm_scale = torch.norm(target, dim=1, keepdim=True)
@@ -142,7 +251,6 @@ class DataLoss(Loss):
         self.J_size = sfModel.ED_nodes.param_num
 
     def forward(self, lambda_, beta, new_data, grad=False, dldT_only=False):
-        # points, norms, valid = new_data
 
         ### Find correspondence based on projective ICP. Jacobian_elements: Nx4x3x4.
         trans_points, Jacobian_elements = Trans_points(self.sf_diff, self.sf_knn, \
@@ -153,15 +261,25 @@ class DataLoss(Loss):
         valid_pair = new_data.valid[proj_coords] # Valid proj-new pairs.
         v, u = v[valid_pair], u[valid_pair]
         ## Find matched points & normal values, and calculate related grad if needed.
-        new_points, dpdPi = LossTool.bilinear_intrpl_block(v, u, new_data.points, grad=grad)
-        new_norms, dndPi = LossTool.bilinear_intrpl_block(v, u, new_data.norms, grad=grad)
+        # new_points, dpdPi = LossTool.bilinear_intrpl_block(v, u, new_data.points, grad=grad)
+        # new_norms, dndPi = LossTool.bilinear_intrpl_block(v, u, new_data.norms, grad=grad)
+        new_points, dpdPi = LossTool.bilinear_intrpl_block(v, u,
+            new_data.points, index_map=new_data.index_map, grad=grad)
+        new_norms, dndPi = LossTool.bilinear_intrpl_block(v, u,
+            new_data.norms, index_map=new_data.index_map, grad=grad)
+        intrpl_valid = ~torch.any(torch.isnan(new_points)|torch.isnan(new_norms), dim=1)
+        new_points = new_points[intrpl_valid]
+        new_norms = new_norms[intrpl_valid]
 
-        sf_indicies = proj_valid_index[valid_pair]
+        sf_indicies = proj_valid_index[valid_pair][intrpl_valid]
         trans_points = trans_points[sf_indicies].type(fl32_)
         pt_diff = trans_points-new_points# T(p)-o in (13).
         loss = lambda_ * torch.sum(new_norms*pt_diff, dim=1, keepdim=True)
         
         if grad:
+            dpdPi = dpdPi[intrpl_valid]
+            dndPi = dndPi[intrpl_valid]
+
             Jacobian_elements = Jacobian_elements[sf_indicies].type(fl32_)
             knn_weights = self.sf_knn_weights[sf_indicies].unsqueeze(2).unsqueeze(3) # Nx4x1x1
 
@@ -199,106 +317,40 @@ class DataLoss(Loss):
         else:
             return torch.pow(loss,2)
 
-class FeatLoss(Loss):
+    @staticmethod
+    def autograd_forward(model_args, src, trg, flow=None, loss_type='point-plane'):
+        v_, u_, _, valid_idx = pcd2depth(model_args['CamParams'], src.points, round_coords=False, valid_margin=1)
+        u = u_[valid_idx]
+        v = v_[valid_idx]
 
-    def __init__(self, use_depth=False, use_point=False):
-        if use_depth:
-            self.inc_idx = torch.tensor([0,1,2,3,4,5,6], device=dev)
-        elif use_point:
-            self.inc_idx = torch.tensor([[0,1,2,3,4,5,6], \
-                                         [0,1,2,3,4,5,6], \
-                                         [0,1,2,3,4,5,6]], device=dev)
+        if flow is not None:
+            trg_loc, _, _ = bilinear_sample([flow], v, u)
+            trg_loc = trg_loc[0]
+            v += trg_loc[...,0]
+            u += trg_loc[...,1]
 
-        self.use_depth = use_depth
-        self.use_point = use_point
+        if 'seman-super' in model_args['method']:
+            src_seg_conf = neighbor_sample([torch.argmax(trg.seg_conf_map, dim=-1, keepdim=True)], v_, u_)
+            src_seg_conf = src_seg_conf[0].squeeze(-1)
+            valid_idx &= ~torch.any(~(src_seg_conf==torch.argmax(src.seg_conf, dim=-1).unsqueeze(0)), dim=0)
 
-    def prepare(self, sfModel, new_data):
-        self.sf_knn_weights = sfModel.sf_knn_weights
-        self.sf_knn_indices = sfModel.sf_knn_indices
-        self.sf_knn = sfModel.ED_nodes.points[self.sf_knn_indices] # All g_i in (10).
-        self.sf_diff = sfModel.points.unsqueeze(1) - self.sf_knn # (p-g_i) in (10).
-        self.skew_v = get_skew(self.sf_diff)
+            v = v_[valid_idx]
+            u = u_[valid_idx]
 
-        self.J_size = sfModel.ED_nodes.param_num
-
-    def forward(self, lambda_, beta, new_data, grad=False, dldT_only=False):
-        # points, _, valid = new_data
-
-        if self.use_depth: features_ = new_data.points[:,2:]
-        elif self.use_point: features_ = new_data.points
-        c_ = features_.size()[1]
-
-        ### Find correspondence based on projective ICP.
-        # Jacobian_elements: Nx4(neighbor_n)x3(x,y,z)x4(quaternion).
-        trans_points, Jacobian_elements = Trans_points(self.sf_diff, self.sf_knn, \
-            beta[self.sf_knn_indices], self.sf_knn_weights, grad=grad, skew_v=self.skew_v)
-        ## Project the updated points to the image plane.
-        ## Only keep valid projections with valid new points.
-        v, u, _, proj_valid_index = pcd2depth(trans_points, round_coords=False)
-        u = u[proj_valid_index]
-        v = v[proj_valid_index]
-
-        # target: Nxc, dVdPi: Nxcx2, Pi: project x,y
-        target, dVdPi = LossTool.bilinear_intrpl_block(v, u, features_, grad=grad)
-        valid_pair = ~torch.any(torch.isnan(target), 1)
-        target = target[valid_pair]
-        sf_indices = proj_valid_index[valid_pair]
-        trans_points = trans_points[sf_indices].type(fl32_)
-
-        # Loss: Feature of current model - Wrapped feature from the new frame.
-        if self.use_depth:
-            loss = lambda_ * (trans_points[:,2:] - target)
-        elif self.use_point:
-            loss = lambda_ * (trans_points - target).view(-1,1)
+        if loss_type == 'point-point':
+            sample_trg, _, sample_valid = bilinear_sample([trg.points], 
+                v, u, index_map=trg.index_map)
+            sample_trg_verts = sample_trg[0]
+            return torch_sq_distance(
+                src.points[valid_idx][sample_valid], sample_trg_verts[sample_valid]).sum()
         
-        if grad:
-            Jacobian_elements = Jacobian_elements[sf_indices].type(fl32_)
-            knn_weights = self.sf_knn_weights[sf_indices].unsqueeze(1).unsqueeze(-1) # Nx1x4x1
-
-            dVdPi = dVdPi[valid_pair]
-
-            ## Include bilinear term loss.
-            dTdq = torch.flatten(torch.transpose(Jacobian_elements,1,2), start_dim=2) # Nx3x(4x4)
-            dPidT = LossTool.dPi_block(trans_points) # Nx2x3(x,y,z)
-
-            dVdT = torch.matmul(dVdPi, dPidT) # dVdPi: Nxcx2, dPidT: Nx2x3(x,y,z), dVdT: Nxcx3
-            del dVdPi, dPidT
-            if dldT_only:
-                dVdT = -dVdT.squeeze(1)
-                dVdT[:,2] += 1.
-                dVdT *= lambda_
-                return torch.block_diag(*dVdT)
-
-            else:
-                match_num = len(trans_points)
-
-                # dVdT: Nxcx3, dTdq: Nx3x(n_neighborsx4), v: Nxcxn_neighborsx4
-                v = - torch.matmul(dVdT,dTdq).view(match_num,c_,n_neighbors,4)
-                vb = - dVdT.unsqueeze(2).repeat(1,1,4,1) # Nxcxn_neighborsx3
-
-                if self.use_depth:
-                    v += Jacobian_elements[:,:,2:,:].permute(0,2,1,3)
-                    vb[...,2] += 1.
-
-                elif self.use_point:
-                    v += Jacobian_elements.permute(0,2,1,3)
-                    vb[:,0,:,0] += 1.
-                    vb[:,1,:,1] += 1.
-                    vb[:,2,:,2] += 1.
-
-                J_idx = LossTool.prepare_Jacobian_idx(c_, \
-                    self.sf_knn_indices[sf_indices], self.inc_idx)
-                
-                vb *= knn_weights
-                v = torch.cat([v,vb], dim=-1).flatten() #Nxcxn_neighborsx7
-
-                Jacobian = torch.sparse_coo_tensor(J_idx, \
-                    lambda_ * v.view(-1), (match_num*c_, self.J_size), dtype=fl32_)
-                
-                return LossTool.prepare_jtj_jtl(Jacobian, loss)
-
-        else:
-            return torch.pow(loss,2)
+        elif loss_type == 'point-plane':
+            sample_trg, _, sample_valid = bilinear_sample([trg.points, trg.norms], 
+                v, u, index_map=trg.index_map)
+            sample_trg_verts, sample_trg_norms = sample_trg
+            return (torch_inner_prod(
+                sample_trg_norms[sample_valid],
+                src.points[valid_idx][sample_valid] - sample_trg_verts[sample_valid])**2).sum()
 
 class ARAPLoss(Loss):
 
@@ -308,7 +360,7 @@ class ARAPLoss(Loss):
 
     def prepare(self, sfModel, new_data):
 
-        self.ED_knn_indices = sfModel.ED_knn_indices
+        self.ED_knn_indices = sfModel.ED_nodes.ED_knn_indices
 
         self.d_EDs = sfModel.ED_nodes.points.unsqueeze(1) - \
                         sfModel.ED_nodes.points[self.ED_knn_indices]
@@ -353,6 +405,24 @@ class ARAPLoss(Loss):
         else:
             return torch.pow(loss,2)
 
+    @staticmethod
+    def autograd_forward(input, beta):
+        nodes = input.points
+        knn_indices = input.knn_indices
+        knn_w = input.knn_w
+        
+        nodes_t = beta[:,4:7]
+        beta = beta[knn_indices]
+        
+        d_nodes = (nodes.unsqueeze(1) - nodes[knn_indices])
+        loss, _ = transformQuatT(d_nodes, beta, skew_v=get_skew(d_nodes))
+        loss -= d_nodes.type(fl32_) + nodes_t.unsqueeze(1)
+
+        loss = knn_w * torch.pow(loss, 2).sum(-1)
+        loss = loss.sum(-1)
+        
+        return loss.sum()
+
 class RotLoss(Loss):
 
     def __init__(self):
@@ -376,7 +446,13 @@ class RotLoss(Loss):
 
             return LossTool.prepare_jtj_jtl(Jacobian, loss)
         else:
-            return torch.pow(loss,2)
+            return torch.pow(loss, 2)
+
+    @staticmethod
+    def autograd_forward(beta):
+        beta = beta[:, 0:4].type(fl32_)
+        loss = 1. - torch.sum(torch.pow(beta,2), dim=1)
+        return torch.pow(loss, 2)
 
 class CorrLoss(Loss):
 
@@ -484,62 +560,3 @@ class CorrLoss(Loss):
         
         else:
             return None
-
-# def CoordLoss(Loss):
-
-#     def __init__(self):
-
-#     def prepare(self, sfModel):
-#         self.sf_knn = sfModel.ED_points[sfModel.surfel_knn_indexs]
-#         self.sf_diff = sfModel.points.unsqueeze(1) - self.sf_knn # p-g_i
-#         self.skew_v = get_skew(self.sf_diff)
-
-#     def forward(self, lambda_, beta, new_data, grad=False, dldT_only=False):
-#     # def forward(lambda_, trans_points, target, \
-#         # grad=False, dldT_only=False, Jacobian_size=None, idx=None, \
-#         # Jacobian_elements=None, knn_weights=None):
-#         # Jacobian_elements: Nx4x3x4
-
-#         v, u, _, _ = pcd2depth(trans_points, vis_only=False, round_coords=False)
-#         # u /= (WIDTH - 1)
-#         # v /= (HEIGHT - 1)
-#         wrap_source = torch.stack([u,v], dim=1)
-#         # wrap_source = wrap_source * 2 - 1
-
-#         loss = lambda_ * (wrap_source - target).type(dtype_).view(-1,1)
-#         -----> target - wrap_source
-#         del v, u, wrap_source, target
-        
-#         if grad:
-
-#             trans_points = trans_points.type(dtype_)
-#             Jacobian_elements = Jacobian_elements.type(dtype_)
-
-#             dPidT = DeformLoss.dPi_block(trans_points) # Nx2x3
-#             # Pi_scale = torch.tensor([[[2/(WIDTH-1)],[2/(HEIGHT-1)]]], dtype=dtype_, device=dev)
-#             # dPidT *= Pi_scale
-
-#             if dldT_only:
-#                 dPidT *= lambda_
-#                 return torch.block_diag(*dPidT)
-
-#             # dTdq = torch.flatten(torch.transpose(Jacobian_elements,1,2), start_dim=2) # Nx3x(4x4)
-
-#             match_num = len(trans_points)
-
-#             v = torch.matmul(dPidT.unsqueeze(1),Jacobian_elements) # Nx4x2x4
-#             vb = dPidT.unsqueeze(1).repeat(1,4,1,1) * knn_weights.unsqueeze(2).unsqueeze(3) # Nx4x2x3
-#             v = torch.cat([v,vb], dim=3).permute(0,2,1,3).flatten()
-
-#             # v = torch.matmul(dPidT,dTdq).view(match_num,2,n_neighbors,4)
-#             # vb = dPidT.unsqueeze(2).repeat(1,1,4,1) * knn_weights.unsqueeze(1).unsqueeze(3)
-#             # v = torch.cat([v,vb], dim=-1).flatten()
-
-#             Jacobian = torch.sparse_coo_tensor(idx, \
-#                 lambda_ * v, Jacobian_size, dtype=dtype_)
-
-#             return DeformLoss.prepare_jtj_jtl(Jacobian, loss)
-
-#         else:
-
-#             return torch.pow(loss,2)

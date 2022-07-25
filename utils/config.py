@@ -1,163 +1,83 @@
 import numpy as np
-import timeit
-import torch
-import os
-import torch
+from dataclasses import dataclass
 
+import torch
+import torchvision.transforms as T
+
+"""
+Devices.
+"""
 dev = torch.device('cuda:0')
+cpu = torch.device('cpu:0')
 
 torch_version = torch.__version__
 
-tfdtype_ = torch.float64
-dtype_ = torch.float32
-
+"""
+Data types.
+"""
 fl64_ = torch.float64
 fl32_ = torch.float32
 int_ = torch.int
 long_ = torch.int64
 bool_ = torch.bool
 
-#############################
+"""
+Data normalizer for networks.
+"""
+normalize = T.Compose(
+            [T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                     std=[0.229, 0.224, 0.225]),]
+            )
+normalize_only = T.Compose(
+            [T.Normalize(mean=[0.485, 0.456, 0.406],
+                     std=[0.229, 0.224, 0.225]),]
+            )
 
-# Camera Parameter
+de_normalize = T.Compose([T.Normalize(mean = [ 0., 0., 0. ],
+                                    std = [ 1/0.229, 1/0.224, 1/0.225 ]),
+                        T.Normalize(mean = [ -0.485, -0.456, -0.406 ],
+                                std = [ 1., 1., 1. ]),
+                        ])
 
-#############################
-# Parameters of images in super data set
-fx = 768.98551924
-fy = 768.98551924
-cx = 292.8861567
-cy = 291.61479526
-# K = np.array([[fx,  0, cx],
-#                 [ 0, fy, cy],
-#                 [ 0,  0,  1]])# Camera intrinsic matrix
+"""
+Dataset parameters
+"""
+@dataclass
+class OldSuPerParams:
+    HEIGHT: int = 480
+    WIDTH: int = 640
+    fx: float = 768.98551924
+    fy: float = 768.98551924
+    cx: float = 292.8861567
+    cy: float = 291.61479526
+    depth_scale: float = 1/100. # depth unit: cm -> m
+    # But I feel the unit of the input depth maps is mm.
+    THRESHOLD_COSINE_ANGLE: float = 0.4 # C++ code: accept angle < 30 degree (0.87), 67 degree (0.4)
+    THRESHOLD_DISTANCE: float = 0.2 # C++ code value: 0.2
+    SQRT2: float = np.sqrt(2)
+    DIVTERM: float = 1./(2.*0.6*0.6)
+    CONF_TH: float = 10.0 # TODO: Select better value.
+    STABLE_TH: float = 30.0
+    n_neighbors: int = 4
+    ED_n_neighbors: int = 8
 
-#############################
+    INP_HEIGHT: int = 1080
+    INP_WIDTH: int = 1920
+    K1: np.ndarray = np.array(  [[1.6264394029428900e+03, 0., 8.3440153256181497e+02],
+                                [0., 1.6210282483131000e+03, 4.2607815615404297e+02],
+                                [0., 0., 1. ]] ).reshape(3,3)
+    K2: np.ndarray = np.array(  [[ 1.6536267010886600e+03, 0., 1.0996315512747401e+03],
+                                [0., 1.6521704703888099e+03, 4.0353935560440999e+02],
+                                [0., 0., 1.]] ).reshape(3,3)
+    D1: np.ndarray = np.array(  [ -2.6198574218752801e-01, 9.7542413719703500e-02, 0., 0., 1.2212836507229301e+00 ]).reshape(1,5)
+    D2: np.ndarray = np.array(  [ -3.3212206141363598e-01, 4.5246067056600803e-01, 0., 0., -2.7578612117510998e-01]).reshape(1,5)
+    T: np.ndarray = np.array(   [ -5.8513759749420302e+00, 1.1863526038796400e-01, 8.1409249931785599e-01]).reshape(3,1)
+    R: np.ndarray = np.array(   [[9.9853943863456995e-01, -1.3270688328128599e-03, -5.4011372688262498e-02],
+                                [1.7410235217250401e-03, 9.9996946787925500e-01, 7.6178833265481997e-03],
+                                [5.3999614150975303e-02, -7.7007920107660102e-03, 9.9851126156591397e-01]]).reshape(3,3)
+    scaling_factor: int = 2
+    depth_scaling: int = 10
 
-# Configuarations.
-
-#############################
-n_neighbors = 4
-ED_n_neighbors = 8
-
-ED_sample_method = 'grid' # ED node sampling method.
-if ED_sample_method == 'uniform': ED_rad = 0.2
-
-render_method = 'pulsar' # Options: pulsar, proj
-corr_method = 'kornia' # Options: opencv, kornia (LoFTR)
-
-estimate_cam_pose = False
-
-#############################
-
-# Display setting
-
-#############################
-P_time = True # If true, print time spent by each important function.
-
-output_folder = "./outputs" # Parent folder.
-evaluate_folder = "./evaluates" # Folder of results for evaluation.
-folders = [] # Init the list of child folders.
-
-# If ture, save an image of the reconstructed 3D scene, where the colors 
-# represent the normal directions.
-vis_depth_preprocessing = True
-if vis_depth_preprocessing: 
-    F_depth_prepro = os.path.join(output_folder,"depth_prepro")
-    folders.append(F_depth_prepro)
-
-# If true, save the rendered image after each iter.
-save_render_img = True
-vis_ED_nodes = True
-if save_render_img:
-    F_render_img = os.path.join(output_folder,"render_imgs")
-    folders.append(F_render_img)
-
-# If true, save the image of points with continuous colors for qualitative evaluation.
-qual_color_eval = False
-if qual_color_eval:
-    F_qual_color_img = os.path.join(output_folder,"qual_color_imgs")
-    folders.append(F_qual_color_img)
-
-# If true, save images with tracking ground truth & results of the 20 labeled points 
-# in the SuPer dataset.
-vis_super_track_rst = True
-if vis_super_track_rst:
-    F_super_track = os.path.join(output_folder,"super_track")
-    folders.append(F_super_track)
-
-# If true, save images with matched feature points.
-vis_img_matching = True
-if vis_img_matching:
-    F_img_matching = os.path.join(output_folder,"img_matching")
-    folders.append(F_img_matching)
-
-debug_mode = False # TODO
-visualize = False # TODO If true, visualize surfels as the program runsç.
-open3d_visualize = False # TODO If true, visualize using open3d. Otherwise, visualize using opencv.
-
-
-
-save_opt_rst = False # If true, save data/images of the errors before & after LM Algorithm.
-
-use_mask = False #  If true, read the segmentation mask to exclude instrument depth info from the depth map
-
-
-
-
-
-# tracking_rst_folder = os.path.join(output_folder,"track_rst")
-# match_folder = os.path.join(output_folder,"matches")
-# qual_color_folder = os.path.join(output_folder,"qual_color_images")
-# error_folder = os.path.join(output_folder,"error_images")
-# o3d_display_dir = os.path.join(output_folder,"o3d_display")
-
-
-
-
-HEIGHT = 480
-WIDTH = 640
-PIXEL_NUM = HEIGHT * WIDTH
-zero_img = torch.zeros((HEIGHT,WIDTH,3), dtype=dtype_, device=dev)
-
-U = torch.arange(WIDTH, dtype=dtype_, device=dev)
-V = torch.arange(HEIGHT, dtype=dtype_, device=dev)
-V, U = torch.meshgrid(V, U)
-
-################
-# inputStream.py
-################
-
-dataset_class = 'RGBD_mask'
-
-depth_scale = 1/100. # depth unit: cm -> m
-# But I feel the unit of the input depth maps is mm.
-
-SQRT2 = np.sqrt(2)
-DIVTERM = 1./(2.*0.6*0.6)
-
-THRESHOLD_COSINE_ANGLE = 0.4 # C++ code: accept angle < 30 degree (0.87), 67 degree (0.4)
-THRESHOLD_DISTANCE = 0.2 # C++ code value: 0.2
-
-CONF_TH = 10.0 # TODO: Select better value.
-STABLE_TH = 30.0
-
-UPPER_ED_DISTANCE = 0.30 # Threshold (30mm) for deciding if a new surfel should be an ED node.
-LOWER_ED_DISTANCE = 0.05 # Threshold (5mm) for deciding if a ED node should be deleted.
-CLS_SIZE_TH = 300
-
-
-
-
-
-
-# #####################################################################################################################
-# # PWC-Net MODEL INFO
-# #####################################################################################################################
-
-# model_module_to_load = "full_model" # A: "only_flow_net", B: "full_model"
-# model_name           = "model_A"    # your model's name, e.g., "model_A", "chairs_things"
-# model_iteration      = "pt"            # iteration number of the model you want to load
-
-# saved_model = os.path.join("./experiments", "models", model_name, f"{model_name}_{model_iteration}.pt")
-
-# # freeze_optical_flow_net = False
+    seg_class_num: int = 4
+    max_disp: int = 96

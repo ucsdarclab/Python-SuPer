@@ -1,335 +1,322 @@
-import numpy as np
-import random
-import argparse
-import copy
+import os
 import shutil
-
-import torch.nn as nn
-import torch.optim as optim
-
+import numpy as np
+np.random.seed(0)
+import random
+random.seed(0)
+import argparse
 from reprint import output
 
-import models
+import torch
+torch.manual_seed(0)
+
+from models.submodules import *
+
 from utils.utils import *
 
-from utils.config import *
-from utils.inputStream import *
-from utils.render import *
-
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 def main():
 
-    seed = 42
-    random.seed(seed)
-    np.random.seed(seed)
-
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', action='store', dest='data_dir', required=True, help='Provide input depth directory')
-    parser.add_argument('--method', action='store', dest='method', default='super', help='') # super: original version of super
-    parser.add_argument('--phase', action='store', dest='phase', default='test', help='train, test')
-    parser.add_argument('--img_format', action='store', dest='img_format', help='Provide image (rgb/depth/seg_mask) format')
-    parser.add_argument('--evaluate_super', action='store', type=float, dest='evaluate_super', default=0.0, help='')
-    
-    # Cost Functions
-    parser.add_argument('--data_cost', action='store', type=float, dest='data_cost', default=0.0, help='')
-    parser.add_argument('--depth_cost', action='store', type=float, dest='depth_cost', default=0.0, help='')
-    parser.add_argument('--corr_cost', action='store', type=float, dest='corr_cost', default=0.0, help='')
-    parser.add_argument('--arap_cost', action='store', type=float, dest='arap_cost', default=0.0, help='')
-    parser.add_argument('--rot_cost', action='store', type=float, dest='rot_cost', default=0.0, help='')
+    parser.add_argument('--data', dest='data', default='super')
+    parser.add_argument('--data_dir', dest='data_dir', required=True)
+    parser.add_argument('--height', type=int, dest='height')
+    parser.add_argument('--width', type=int, dest='width')
 
-    # Use square root of the lambda.
-    parser.add_argument('--data_lambda', action='store', type=float, dest='data_lambda', default=1., help='')
-    parser.add_argument('--depth_lambda', action='store', type=float, dest='depth_lambda', default=0.1, help='')
-    parser.add_argument('--corr_lambda', action='store', type=float, dest='corr_lambda', default=np.sqrt(10.), help='')
-    parser.add_argument('--arap_lambda', action='store', type=float, dest='arap_lambda', default=np.sqrt(10.), help='')
-    parser.add_argument('--rot_lambda', action='store', type=float, dest='rot_lambda', default=10.0, help='')
+    parser.add_argument('--mod_id', type=int, dest='mod_id')
+    parser.add_argument('--exp_id', type=int, dest='exp_id')
+    parser.add_argument('--method', dest='method', default='super')
+    parser.add_argument('--sample_dir', dest='sample_dir', default='sample')
+    # parser.add_argument('--evaluate_tracking', action='store_false', dest='evaluate_tracking')
+    # parser.set_defaults(evaluate_tracking=False)
+
+    """
+    Cost functions for LM optim.
+    """
+    # For meshes.
+    parser.add_argument('--m_point_plane', action='store_true', dest='m_point_plane')
+    parser.add_argument('--m_point_point', action='store_true', dest='m_point_point')
+    parser.add_argument('--m_pp_lambda', type=float, dest='m_pp_lambda', default=1.)
+    parser.set_defaults(m_point_plane=False)
+    parser.set_defaults(m_point_point=False)
+    parser.add_argument('--m_edge', action='store_true', dest='m_edge')
+    parser.add_argument('--m_edge_lambda', type=float, dest='m_edge_lambda', default=10.)
+    parser.set_defaults(m_edge=False)
+    parser.add_argument('--m_arap', action='store_true', dest='m_arap')
+    parser.add_argument('--m_arap_lambda', type=float, dest='m_arap_lambda', default=10.)
+    parser.set_defaults(m_arap=False)
+    parser.add_argument('--m_rot', action='store_true', dest='m_rot')
+    parser.add_argument('--m_rot_lambda', type=float, dest='m_rot_lambda', default=10.)
+    parser.set_defaults(m_rot=False)
+    # For surfels.
+    parser.add_argument('--sf_point_plane', action='store_true', dest='sf_point_plane')
+    parser.add_argument('--sf_pp_lambda', type=float, dest='sf_pp_lambda', default=1.)
+    parser.set_defaults(sf_point_plane=False)
+    parser.add_argument('--sf_corr', action='store_true', dest='sf_corr')
+    parser.add_argument('--sf_corr_lambda', type=float, dest='sf_corr_lambda', default=10.)
+    parser.set_defaults(sf_corr=False)
+
+    """
+    Parameters for end-to-end.
+    """
+    parser.add_argument('--phase', action='store', dest='phase', default='test', help='train/test')
+
+    ## Loss functions for end-to-end.
+    parser.add_argument('--e2e_sf_point_plane', action='store_true', dest='e2e_sf_point_plane')
+    parser.add_argument('--e2e_sf_pp_lambda', type=float, dest='e2e_sf_pp_lambda', default=1.)
+    parser.set_defaults(e2e_sf_point_plane=False)
+    parser.add_argument('--e2e_photo', action='store_true', dest='e2e_photo')
+    # If e2e_dy_photo = True, render image with colors extracted from the previous frame.
+    parser.add_argument('--e2e_dy_photo', action='store_true', dest='e2e_dy_photo')
+    parser.add_argument('--e2e_photo_lambda', type=float, dest='e2e_photo_lambda', default=1.)
+    parser.set_defaults(e2e_photo=False)
+    parser.set_defaults(e2e_dy_photo=False)
+    parser.add_argument('--e2e_feat', action='store_true', dest='e2e_feat')
+    parser.add_argument('--e2e_dy_feat', action='store_true', dest='e2e_dy_feat')
+    parser.add_argument('--e2e_feat_lambda', type=float, dest='e2e_feat_lambda', default=1.)
+    parser.set_defaults(e2e_feat=False)
+    parser.set_defaults(e2e_dy_feat=False)
+
+    # Parameters for training.
+    parser.add_argument('--stage', action='store', dest='stage', default='train_graph_enc', help='')
+    parser.add_argument('--batch_size', action='store', type=int, dest='batch_size', default=1, help='')
+    parser.add_argument('--epoch_num', action='store', type=int, dest='epoch_num', default=2, help='')
+    parser.add_argument('--seq_len', action='store', type=int, dest='seq_len', default=2, help='')
+    parser.add_argument('--lr', action='store', type=float, dest='lr', default=0.001, help='')
+    parser.add_argument('--lr_decay_rate', action='store', type=int, dest='lr_decay_rate', default=5, help='')
+    
+    
+    parser.add_argument('--checkpoint_dir', action='store', dest='checkpoint_dir', default='checkpoints', help='Path to checkpoints.')
+    parser.add_argument('--save_checkpoint_freq', action='store', type=int, dest='save_checkpoint_freq', default=100, help='')
+    parser.add_argument('--save_tr_sample_freq', action='store', type=int, dest='save_tr_sample_freq', default=20, 
+    help='Frequency to save sample results during training.')
+
+    # Parameters for RAFT (optical flow).
+    parser.add_argument('--optical_flow_method', dest='optical_flow_method')
+    parser.add_argument('--small', action='store_true', help='use small model')
+    parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
+    parser.add_argument('--optical_flow_pretrain_dir', dest='optical_flow_pretrain_dir', 
+        default='./RAFT/models/raft-small.pth')
+    parser.add_argument('--no_optical_flow_pretrain', action='store_false', dest='optical_flow_pretrain')
+    parser.set_defaults(optical_flow_pretrain=True)
+
+    # Parameters for PSMNet.
+    parser.add_argument('--depth_est_method', dest='depth_est_method')
+    parser.add_argument('--depth_est_pretrain_dir', dest='depth_est_pretrain_dir', 
+        default='./psm/pretrained_model_KITTI2015.tar')
+    parser.add_argument('--no_depth_est_pretrain', action='store_false', dest='depth_est_pretrain')
+    parser.set_defaults(depth_est_pretrain=True)
+    
+    # Parameters for testing.
+    parser.add_argument('--tracking_gt_file', dest='tracking_gt_file')
+    # parser.add_argument('--gt_idx_file', dest='gt_idx_file')
+
+    # Choose modules for graph encoding.
+    parser.add_argument('--graph_enc_method', dest='graph_enc_method', default='grid')
 
     args = parser.parse_args()
+    if args.phase == 'test':
+        args.sample_dir = os.path.join(args.sample_dir, f"model{args.mod_id}_exp{args.exp_id}")
+    model_args = init_params(args)
 
-    data_dir = args.data_dir
-    img_format = args.img_format
-    if not img_format:
-        img_format = "png"
-    evaluate_super = bool(args.evaluate_super) # If evaluate the tracking performance on the 20 labeled points in the SuPer dataset.
+    model = init_nets(model_args) # Init models /,& networks.
 
-    data_cost = bool(args.data_cost)
-    depth_cost = bool(args.depth_cost)
-    corr_cost = bool(args.corr_cost)
-    arap_cost = bool(args.arap_cost)
-    rot_cost = bool(args.rot_cost)
-
-    if args.phase == "test":
-        out_filename = name_file(args.method, data_cost, depth_cost, \
-            arap_cost, rot_cost, corr_cost, \
-            args.data_lambda, args.depth_lambda, args.arap_lambda, \
-            args.rot_lambda, args.corr_lambda)
-
-    # Prepare empty folder for saving rendering/tracking/etc. results
-    reset_folder(output_folder)
-    if len(folders) > 0:
-        for folder in folders:
-            os.makedirs(folder)
-    if not os.path.exists(evaluate_folder):
-        os.makedirs(evaluate_folder)
-
-    if evaluate_super:
-
-        # Coordinates of the 20 points.
-        with open(os.path.join(data_dir,'labelPts.npy'), 'rb') as f:
-            labelPts = np.load(f,allow_pickle=True).tolist()
-
-        # IDs of frames with labels.
-        with open(os.path.join(data_dir,'eva_id.npy'), 'rb') as f:
-            eva_ids = np.load(f,allow_pickle=True).tolist()
-        eva_ids = np.array(eva_ids)
+    prepare_folders(args)
 
     ########################################################
 
     # Track and update the 3D scene (surfels) frame-by-frame.
 
     ########################################################
-    if args.method == 'super' or\
-        (args.method == 'dlsuper' and args.phase == 'test'):
+    if args.method in ['super', 'seman-super'] or args.phase == 'test':
 
-        # TODO
-        if visualize:
-            win_subject = 'Project Surfels'
+        # Init data loader.
+        testloader = init_dataset(model_args)
 
-        time = torch.tensor(0.0, device=dev) # Timestamp; TODO: If reading imgs from rosbag, use the true timestamps.
-        init_surfels = True # True: Need to init the surfels with a depth map.
+        # init_surfels = True # True: Need to init the surfels with a depth map.
         iter_time_list = [] # List of time spent in each iteration.
 
-        # Find the max frame ID.
-        imglist = os.listdir(data_dir)
-        imglist.sort()
-        while True:
-            imgname = imglist.pop(-1)
-            if imgname.endswith(img_format):
-                frame_num = int(imgname.split('-')[0])
-                break
-        print("Total frame number: {} \n".format(frame_num))
+        # with output(initial_len=15, interval=0) as output_lines:
+        for data in testloader:
+            print(data["ID"].item())
 
-        # Init the tracking & reconstruction method.
-        mod = models.SuPer(args.method, \
-            data_cost, corr_cost, depth_cost, arap_cost, rot_cost, \
-            args.data_lambda, args.corr_lambda, args.depth_lambda, \
-            args.arap_lambda, args.rot_lambda, \
-            evaluate_super)
+            model["super"](model, data)
 
-        if P_time:
-            print("Running time (s):")
-            P_table_line = "----------------------------------------------"
-            print(P_table_line)
-            print("        Steps       |  Ave.  |  Min.  |  Max. ")
-            print(P_table_line)
+        write_args(os.path.join(args.sample_dir, "config.txt"), args)
+        
+        if model_args['evaluate_tracking']:
+            with open(os.path.join(args.sample_dir, f"tracking_rst.npy"), 'wb') as f:
+                np.save(f, model["super"].sf.track_rsts)
 
-            # Init step running time: times-ave-min-max
-            depth_prepro_time = runtime_moving_average(init=True)
-            lm_time = runtime_moving_average(init=True)
-            update_time = runtime_moving_average(init=True)
-            fusion_time = runtime_moving_average(init=True)
-            del_unstable_time = runtime_moving_average(init=True)
-
-        with output(initial_len=15, interval=0) as output_lines:
-            
-            for depth_ID in range(frame_num):
-
-                # Read depth map, color image, & instance segmentation mask.
-                rgb, depth = read_imgs(data_dir, depth_ID, img_format)
-                if rgb is None or depth is None:
-                    time += 1.
-                    P_cond = "Faild to read images, move to the next iteration."
                 
-                elif np.max(depth) <= 0:
-                    time += 1.
-                    P_cond = "Invalid depth map, move to the next iteration."
+    # # End-to-end training.
+    # elif model_args['is_training']:
 
-                else:
-                    if P_time: start = timeit.default_timer()
-                    
-                    new_data = depthProcessing(rgb, depth, time, depth_ID) # Preprocessing.
-                    if P_time: depth_prepro_time = runtime_moving_average(inputs=depth_prepro_time, \
-                        new_time=timeit.default_timer() - start)
-                    
-                    if init_surfels:
-                        allModel = mod.init_surfels(new_data)
-
-                        if evaluate_super:
-                            allModel.init_track_pts(eva_ids, labelPts)
-
-                        init_surfels = False
-
-                        # TODO
-                        if visualize:
-                            if open3d_visualize:
-                                vis.add_geometry(allModel.pcd)
-
-                        P_cond = "Init surfels and ED nodes"
-
-                    else:
-
-                        if save_opt_rst:
-                            filename = os.path.join(error_folder,str(depth_ID)+".png")
-                            bf_data_errors = allModel.vis_opt_error(points, norms, valid)
-                        
-                        allModel, times_ = mod.fusion(allModel, new_data)
-
-                        if P_time: 
-                            lm_time = runtime_moving_average(inputs=lm_time, new_time=times_[0])
-                            update_time = runtime_moving_average(inputs=update_time, new_time=times_[1])
-                            fusion_time = runtime_moving_average(inputs=fusion_time, new_time=times_[2])
-                            del_unstable_time = runtime_moving_average(inputs=del_unstable_time, new_time=times_[3])
-
-                        if evaluate_super:
-                            allModel.update_track_pts(depth_ID, labelPts, rgb)
-
-                        # if save_opt_rst:
-                        #     af_data_errors = allModel.vis_opt_error(points, norms, valid)
-                        #     allModel.save_opt_error_maps(bf_data_errors, af_data_errors, filename)
-
-                        if visualize:
-
-                            if open3d_visualize:
-                                allModel.get_o3d_pcd()
-
-                            visualize_surfel(allModel, vis, os.path.join(o3d_display_dir,str(depth_ID)+'.png'))
-
-                        if P_time:
-                            iter_time_ = timeit.default_timer() - start
-                            P_cond = "Iter time: {0:.4f}s".format(iter_time_)
-
-                time += 1.0
-
-                if P_time:
-                    if init_surfels or lm_time[0] == 0:
-                        output_lines[0] = "Depth preprocessing |   -    |   -    |   -    "
-                        output_lines[1] = " Tracking (optim.)  |   -    |   -    |   -    "
-                        output_lines[2] = "  Update 3D Model   |   -    |   -    |   -    "
-                        output_lines[3] = "  Depth map fusion  |   -    |   -    |   -    "
-                        output_lines[4] = "  Delete unstable   |   -    |   -    |   -    "
-                    else:
-                        output_lines[0] = "Depth preprocessing | {0:.4f} | {1:.4f} | {2:.4f}".format(depth_prepro_time[1], depth_prepro_time[2], depth_prepro_time[3])
-                        output_lines[1] = " Tracking (optim.)  | {0:.4f} | {1:.4f} | {2:.4f}".format(lm_time[1], lm_time[2], lm_time[3])
-                        output_lines[2] = "  Update 3D Model   | {0:.4f} | {1:.4f} | {2:.4f}".format(update_time[1], update_time[2], update_time[3])
-                        output_lines[3] = "  Depth map fusion  | {0:.4f} | {1:.4f} | {2:.4f}".format(fusion_time[1], fusion_time[2], fusion_time[3])
-                        output_lines[4] = "  Delete unstable   | {0:.4f} | {1:.4f} | {2:.4f}".format(del_unstable_time[1], del_unstable_time[2], del_unstable_time[3])
-                    output_lines[5] = P_table_line
-                    output_lines[6] = "Iter: {}".format(depth_ID)
-                    output_lines[7] = P_cond
-                    if not init_surfels:
-                        output_lines[8] = "Current ED num: {}, current surfel num: {}".format(allModel.ED_nodes.num, allModel.surfel_num)
-
-            # TODO
-            # print("Finish tracking, close the window.")
-            # if visualize and open3d_visualize:
-            #         vis.destroy_window()
-
-            new_output_folder = output_folder+"_"+out_filename
-            if os.path.exists(new_output_folder):
-                shutil.rmtree(new_output_folder)
-            os.rename(output_folder, new_output_folder)
+    #     def draw_curve(losses):
+    #         """
+    #         Plot and save loss curve.
+    #         """
+    #         fig = plt.figure()
+    #         ax = fig.add_subplot(1, 1, 1)
             
-            if evaluate_super:
-                track_rsts = np.stack(allModel.track_rsts,axis=0)
-                with open(os.path.join(evaluate_folder, out_filename + ".npy"), 'wb') as f:
-                    np.save(f, track_rsts)
+    #         train_loss = losses['train']
+    #         train_loss = torch_to_numpy(torch.stack(train_loss, dim=0))
+    #         ax.plot(train_loss, color='tab:blue') #torch.range(len(losses['train'])), 
+    #         # ax.set_ylim([0,300])
+    #         fig.savefig('loss_curve.jpg')
 
-    elif args.method == 'dlsuper' and args.phase == 'train':
+    #     stage = args.stage
+    #     save_checkpoint_freq = args.save_checkpoint_freq
+    #     save_tr_sample_freq = args.save_tr_sample_freq
 
-        # Init models.
-        mod = models.DeepSuPer(args.method, args.phase, data_cost, depth_cost, \
-            arap_cost, rot_cost, corr_cost, \
-            args.data_lambda, args.depth_lambda, \
-            args.corr_lambda, args.arap_lambda, \
-            args.rot_lambda, evaluate_super).cuda()
-        net = mod.lm.matcher.flow_net
+    #     batch_size = args.batch_size
+    #     epoch_num = args.epoch_num
+    #     lr = args.lr
+    #     lr_decay_rate = args.lr_decay_rate
+    #     seq_len = args.seq_len
 
-        criterion = nn.L1Loss()
-        optimizer = optim.SGD(net.parameters(), lr=0.0001, momentum=0.9)
+    #     # Init data loader.
+    #     # TODO batch size > 1.; Augmentation.
+    #     trainset = SuPerDataset(model_args, nets=nets, transform=None, img_transform=img_transform)
 
-        # Find the max frame ID.
-        imglist = os.listdir(data_dir)
-        imglist.sort()
-        while True:
-            imgname = imglist.pop(-1)
-            if imgname.endswith(img_format):
-                frame_num = int(imgname.split('-')[0])
-                break
-        print("frame number: ", frame_num)
+    #     gamma = 0.9
+    #     losses = {'train':[], 'val':[]}
+    #     if stage == 'train_graph_enc':
+    #         l1_loss = nn.L1Loss()
 
-        running_loss = []
-        idxs = np.arange(frame_num)[5:]
-        seed = 23
+    #         optimizer = optim.Adam(get_deform_graph.parameters(), lr=lr)
+    #         lr_scheduler = ExponentialLR(optimizer, gamma=0.9)
 
-        epoch_num = 50
-        seq_len = 5
-        gamma = 0.9
-        losses = []
-        for epoch in range(epoch_num):  # loop over the dataset multiple times
+    #         # Train iteration.
+    #         trainset.train_shuffle(batch_size, 1)
+    #         iter_num = len(trainset)
+    #         iter_id = 0
+    #         for epoch in range(epoch_num):
+    #             trainloader = DataLoader(trainset, batch_size=batch_size,
+    #                                             shuffle=True, num_workers=2)
 
-            # random.seed(seed)
-            # random.shuffle(idxs)
+    #             for new_data in trainloader:
+    #                 new_data = new_data.to(dev)
 
-            iter_num = frame_num // seq_len
+    #                 # zero the parameter gradients
+    #                 optimizer.zero_grad()
 
-            for i in range(iter_num):
+    #                 # forward + backward + optimize
+    #                 # new_ED_nodes, _ = get_deform_graph(new_data)
+    #                 # loss = get_deform_graph.loss(epoch, new_data)
+    #                 new_ED_nodes = get_deform_graph(new_data)
+    #                 loss = get_deform_graph.loss(new_data, new_ED_nodes)
+    #                 loss.backward()
+    #                 optimizer.step()
 
-                ids = idxs[i*seq_len:(i+1)*seq_len]
-                if len(ids) < seq_len: continue
+    #                 losses['train'].append(loss)
+    #                 draw_curve(losses)
 
-                # zero the parameter gradients
-                optimizer.zero_grad()
-                loss = 0.0
+    #                 # # Save checkpoints.
+    #                 # if (iter_id+1)%save_checkpoint_freq == 0:
+    #                 #     save_checkpoint(checkpoint_dir, model_name, str(iter_id), get_deform_graph)
+                    
+    #                 # Save sample results during training.
+    #                 if (iter_id+1)%save_tr_sample_freq == 0:
+    #                     image = new_data.rgb.detach()
+    #                     cv2.imwrite(
+    #                         os.path.join(F_render_img, "{:02d}_{:02d}.png".format(epoch, iter_id)), 
+    #                         proj_mesh(torch_to_numpy(new_data.rgb)[...,::-1], new_ED_nodes)
+    #                         )
 
-                for k, id_ in enumerate(ids):
+    #                 lr = optimizer.param_groups[0]['lr']
+    #                 print("[Epoch {:d}/{:d}, iter {:d}/{:d}, lr {:.05f}] loss: {:.03f}"\
+    #                 .format(epoch, epoch_num, np.mod(iter_id, iter_num), iter_num, lr, loss))
+                    
+    #                 iter_id += 1
+    #                 seq_id = 0
 
-                    rgb, depth = read_imgs(data_dir, id_, img_format)
+    #             if (epoch+1)%lr_decay_rate == 0:
+    #                 lr_scheduler.step()
 
-                    # Preprocessing.
-                    new_data = depthProcessing(rgb, depth, time, depth_ID)
+    #     elif stage == 'full':
+    #         # Init optimizer.
+    #         optimizer = optim.Adam(nets["optical_flow"].parameters(), lr=lr)
+    #         lr_scheduler = ExponentialLR(optimizer, gamma=0.9)
+            
+    #         # For calculate loss.
+    #         l1_loss = nn.L1Loss()
 
-                    if k == 0:
-                        allModel, init_surfels = mod.init_surfels(points, norms, rgb, \
-                            rgb_flatten, rad, conf, isED, valid)
-                    else:
-                        # forward + backward + optimize
-                        # outputs = mod.optim(allModel, points, norms, rgb, rgb_flatten, \
-                        #     rad, conf, isED, valid, id_, prev_rgb, i)
-                        # rgb = torch.as_tensor(rgb, dtype=dtype_, device=dev)
-                        # outputs_valid = outputs > 1.
-                        # loss += (gamma**(seq_len-1-k)) * criterion(outputs[outputs_valid], rgb[outputs_valid])
-                        outputs, target = mod.optim(allModel, points, norms, rgb, rgb_flatten, \
-                            rad, conf, isED, valid, id_, prev_rgb, i)
-                        loss += (gamma**(seq_len-1-k)) * torch.mean(outputs)
-                    prev_rgb = rgb
-                
-                loss.backward()
-                optimizer.step()
+    #         # Train iteration.
+    #         for epoch in range(epoch_num):
+    #             trainset.train_shuffle(batch_size, seq_len)
+    #             trainloader = iter(DataLoader(trainset, batch_size=batch_size,
+    #                                             shuffle=False, num_workers=2))
 
-                # print statistics
-                losses.append(loss.item())
-                running_loss.append(loss.item())
-                if i == 0 or i % 10 == 9:    # print every 10 mini-batches
-                    print('[%d/%5d] loss: %.3f' %
-                        (epoch + 1, i + 1, np.mean(running_loss)))
-                    running_loss = []
+    #             iter_num = len(trainset) // seq_len
+    #             iter_id = 0
+    #             for i in range(iter_num):
+    #                 # zero the parameter gradients
+    #                 optimizer.zero_grad()
+    #                 # Reset loss.
+    #                 graph_enc_loss = 0.0
+    #                 super_loss = 0.0
+    #                 render_img = []
 
-            if epoch % 1 == 0:
-                # end_model_iteration = epoch * iter_num
-                # updated_model = os.path.join("./experiments", "models", model_name, \
-                #     f"{model_name}_{end_model_iteration}.pt")
-                updated_model = get_PWCNet_model(str(epoch*iter_num))
-                torch.save(net.state_dict(), updated_model)
+    #                 for seq_id in range(seq_len):
+    #                     with torch.no_grad():
+    #                         new_data = next(trainloader).to(dev) 
+    #                         new_data.x = nets["optical_flow"].fnet((2 * new_data.rgb - 1.0).contiguous())
 
-                np.save("loss_"+ out_filename + ".npy", np.array(losses))
+    #                     new_ED_nodes = get_deform_graph(new_data)
+    #                     # # Graph reconstruction loss (?)
+    #                     # graph_enc_loss += get_deform_graph.loss(new_data, new_ED_nodes)
 
-        # end_model_iteration = epoch_num * iter_num
-        # updated_model = os.path.join("./experiments", "models", model_name, \
-        #     f"{model_name}_{end_model_iteration}.pt")
-        updated_model = get_PWCNet_model(str(epoch_num*iter_num))
-        torch.save(net.state_dict(), updated_model)
-        print('Finished Training')
+    #                     if seq_id == 0:
+    #                         # Init surfels.
+    #                         sfModel = mod.init_surfels(new_data, new_ED_nodes)
+
+    #                     else:
+    #                         w = gamma**(seq_len-1-seq_id)
+    #                         sfModel = mod.fusion(sfModel, new_data, new_ED_nodes, nets=nets)
+
+    #                         super_loss += w * mod.get_loss(sfModel, new_data)
+    #                         sfModel.rgb = new_data.rgb # TODO
+    #                         if end2end_args['e2e_dy_feat'][0]:
+    #                             sfModel.x = new_data.x # TODO
+
+    #                         # render_img.append(
+    #                         #     proj_mesh(
+    #                         #         torch_to_numpy(255 * de_normalize(sfModel.renderImg).permute(1,2,0))[...,::-1], 
+    #                         #         sfModel.ED_nodes)
+    #                         # )
+    #                         with torch.no_grad():
+    #                             render_img_temp = de_normalize(sfModel.renderImg)
+    #                             render_img_temp[sfModel.projGraph > 0] = 1.
+    #                             render_img.append(transforms.Resize((int(HEIGHT/3), int(WIDTH/3)))(render_img_temp))
+
+    #                 losses['train'].append(super_loss.detach())
+    #                 draw_curve(losses)
+
+    #                 # TODO: Optimization
+    #                 (graph_enc_loss + super_loss).backward()
+    #                 optimizer.step()
+
+    #                 # Save checkpoints.
+    #                 if (iter_id+1)%save_checkpoint_freq == 0:
+    #                     save_checkpoint(checkpoint_dir, "raft", str(iter_id), nets["optical_flow"])
+
+    #                 print("[Epoch {:d}/{:d}, iter {:d}/{:d}] graph_enc_loss: {:.02f}, super_loss: {:.03f}"\
+    #                 .format(epoch, epoch_num, iter_id, iter_num, graph_enc_loss, super_loss))
+    #                 iter_id += 1
+                    
+    #                 # render_img = np.concatenate(render_img, axis=1)
+    #                 # cv2.imwrite(
+    #                 #     os.path.join(F_render_img, "{:02d}.png".format(iter_id)), render_img
+    #                 #     )
+    #                 save_image(make_grid(torch.cat(render_img, dim=0)),
+    #                 os.path.join(F_render_img, "{:02d}.png".format(iter_id))
+    #                 )
+
+    #     RAFT_PATH = os.path.join(checkpoint_dir, f"raft_exp{mod_id}_end.pt")
+    #     torch.save(nets["optical_flow"].state_dict(), RAFT_PATH)
+    #     write_args(config_PATH, args)
+    #     print('Finished Training')
 
 
 if __name__ == '__main__':

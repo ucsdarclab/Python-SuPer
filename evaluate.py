@@ -5,61 +5,52 @@ import matplotlib.pyplot as plt
 from utils.utils import *
 from utils.config import *
 
-def evaluate(gt, est, normalize=True, start=18, end=30):
-# def evaluate(gt, est, normalize=True, start=0, end=52):
+def evaluate(gt, est, normalize=False):
 
-    diff = distance(gt,est)
+    diff = []
+    diff_valid = []
+    for key in est.keys():
+        diff.append(distance(gt[int(key)],est[key]))
+        diff_valid.append(gt[int(key)][:,0] >= 0)
+
+    # print(diff_valid)
+    diff = np.stack(diff)
+    diff_valid = np.stack(diff_valid)
     
     mean_ = []
     std_ = []
-    valid = (gt[:,:,0] > 0) & (gt[:,:,1] > 0)
-    for i in range(20):
-        diff_temp = diff[:,i][valid[:,i]]
+    for i in range(diff.shape[1]):
+        diff_temp = diff[:,i][diff_valid[:,i]]
         # Normalize the coordinates by image size.
         if normalize: diff_temp /= HEIGHT
-        mean_.append(np.mean(diff_temp[start-1:end]))
-        std_.append(np.std(diff_temp[start-1:end]))
+        mean_.append(np.mean(diff_temp))
+        std_.append(np.std(diff_temp))
 
     return np.array(mean_), np.array(std_)
 
 def main():
+    new_evaluate_folder = os.path.join(result_folder, evaluate_folder)
 
-    # Load ground truth.
-    with open(os.path.join(evaluate_folder, "gt.npy"), 'rb') as f:
-            gt = np.load(f).astype(float)
+    data_dir = "/media/bear/77f1cfad-f74f-4e12-9861-557d86da4f68/research_proj/datasets/3d_data/super_dataset/new_super"
+    gt_file = "uncover1l_pts.npy"
+    gt_file = os.path.join(data_dir, gt_file)
+    gt = np.array(np.load(gt_file, allow_pickle=True)).tolist()['gt']
 
     colors = ['tab:red', 'tab:green', 'tab:orange', \
         'tab:blue', 'tab:pink', 'tab:gray', 'tab:cyan']
-    files = {"C++SuPer":"cpp_super.npy", \
-        # "pySuPer(data,arap,rot)":"super-pulsar_data_ARAP_rot.npy", \
-        "pySuPer (data,arap,rot)":"default.npy", \
-        # "pySuPer+grid+smoothZ+SNE(data,arap,rot)":"default-SNE.npy", \
-        # "pySuPer+uniform+smoothZ(data,arap,rot)":"default-uniform.npy", \
-        # "pySuPer+grid+smoothZ+proj(data,arap,rot)":"default-proj.npy", \
-        # "pySuPer+grid+proj(data,arap,rot)":"default-proj-raw.npy", \
-        "pySuPer (data,arap,rot,corr)":"super_data_ARAP_rot.npy", \
+    files = {
+        "SuPer(data,arap,rot)": "exp1.npy", \
+        "semantic-SuPer(data,arap,rot)": "exp2.npy", \
         }
-    # "SURF":"surf.npy"
-    # Default setting: super; grid, pulsar, filterZ; losses: data, ARAP, rot
-    ## Compare with default:
-    # a) default-SNE: worse
-    # b) default-uniform: no diff
-    # c) default-proj: no diff
-    # d) default-proj-raw: worse, raw--- no smooth
-    # e) FeatLoss: Use smaller lambda (0.1) for depth / point loss; depth loss is 
-    #    slightly worse than data loss; point loss is slightly better than data
-    #    loss; no diff when data+depth / data+point.
-    # f) CorrLoss: opencv matcher, large weight --> worse, small weight --> no diff
 
     plt.figure(figsize=(10,3))
-    ind = np.arange(20)
+    ind = np.arange(gt.shape[1])
     bar_width = 0.4
     offset = 0.0
 
     for key, color_ in zip(files.keys(), colors):
         # Load the corresponding tracking results.
-        with open(os.path.join(evaluate_folder, files[key]), 'rb') as f:
-            rst = np.load(f).astype(float)
+        rst = np.load(os.path.join(new_evaluate_folder, files[key]), allow_pickle=True).tolist()
 
         mean_, std_ = evaluate(gt, rst)
         

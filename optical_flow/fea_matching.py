@@ -7,7 +7,6 @@ import kornia as K
 import kornia.feature as KF
 from kornia_moons.feature import *
 
-from models import pwcnet
 from utils.config import *
 from utils.utils import *
 
