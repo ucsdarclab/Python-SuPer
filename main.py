@@ -1,14 +1,13 @@
 import os
+os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 import shutil
 import numpy as np
-np.random.seed(0)
 import random
-random.seed(0)
 import argparse
 from reprint import output
 
 import torch
-torch.manual_seed(0)
+import torch.backends.cudnn as cudnn
 
 from models.submodules import *
 
@@ -18,48 +17,303 @@ from utils.utils import *
 def main():
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', dest='data', default='super')
-    parser.add_argument('--data_dir', dest='data_dir', required=True)
-    parser.add_argument('--height', type=int, dest='height')
-    parser.add_argument('--width', type=int, dest='width')
 
-    parser.add_argument('--mod_id', type=int, dest='mod_id')
-    parser.add_argument('--exp_id', type=int, dest='exp_id')
-    parser.add_argument('--method', dest='method', default='super')
-    parser.add_argument('--sample_dir', dest='sample_dir', default='sample')
-    # parser.add_argument('--evaluate_tracking', action='store_false', dest='evaluate_tracking')
-    # parser.set_defaults(evaluate_tracking=False)
+    # DATA options
+    parser.add_argument('--data', 
+                        dest='data', 
+                        default='super')
+    parser.add_argument('--data_dir', 
+                        dest='data_dir', 
+                        required=True)
+    parser.add_argument('--height', 
+                        type=int, 
+                        default=480)
+    parser.add_argument('--width', 
+                        type=int, 
+                        default=640)
+    parser.add_argument('--sample_dir', 
+                        dest='sample_dir', 
+                        default='sample')
+    parser.add_argument('--save_raw_data',
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--save_ply',
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--save_seman_ply',
+                        action='store_true', 
+                        default=False)
+
+    # MODEL options
+    parser.add_argument('--mod_id', 
+                        type=int,
+                        required=True)
+    parser.add_argument('--exp_id', 
+                        type=int, 
+                        required=True)
+    parser.add_argument('--save_sample_freq', 
+                        type=int, 
+                        default=10)
+    parser.add_argument('--method', 
+                        dest='method', 
+                        default='super')
+    parser.add_argument("--downsample_params", 
+                        nargs="+", 
+                        type=float, 
+                        help="only for encoding ED nodes", 
+                        default=[0.1, 50, 0.1])
+    parser.add_argument("--ball_piv_radii", 
+                        nargs="+", 
+                        type=float, 
+                        help="only for encoding ED nodes", 
+                        default=[0.08])      
+    parser.add_argument("--num_layers",
+                        type=int,
+                        help="number of resnet layers",
+                        default=0,
+                        choices=[0, 18, 34, 50, 101, 152])
+    parser.add_argument('--pretrained_encoder_checkpoint_dir', 
+                        dest='pretrained_encoder_checkpoint_dir', 
+                        help='Path to pretrained encoder checkpoints.')
+    parser.add_argument('--depth_model', 
+                        dest='depth_model')
+    parser.add_argument('--pretrained_depth_checkpoint_dir', 
+                        dest='pretrained_depth_checkpoint_dir', 
+                        help='Path to pretrained depth model checkpoints.')
+    parser.add_argument("--depth_dir",
+                        help="if load_depth, input the path to depth map files")
+    parser.add_argument("--depth_type",
+                        help="if load_depth, type of depth map file",
+                        default=".npy")
+    parser.add_argument("--normal_model",
+                        default="8neighbors")
+    parser.add_argument('--seg_model', 
+                        dest='seg_model')
+    parser.add_argument('--pretrained_seg_checkpoint_dir',
+                        dest='pretrained_seg_checkpoint_dir',
+                        help='Path to pretrained segmentation model checkpoints.')
+    parser.add_argument("--load_seman",
+                        help="if set, load the predicted segmentation map",
+                        action="store_true")
+    parser.add_argument("--load_seman_gt",
+                        help="if set, load the segmentation ground truth",
+                        action="store_true")
+    parser.add_argument("--seman_type",
+                        help="if load_seman, type of semantic map file",
+                        default=".npy")
+    parser.add_argument("--hard_seman",
+                        action="store_true",
+                        default=False)
+    parser.add_argument("--del_seman_classes", 
+                        nargs="+", 
+                        type=int, 
+                        help="classes ID that will be ignored for tracking", 
+                        default=[])
+    parser.add_argument("--scales", 
+                        nargs="+", 
+                        type=int, 
+                        help="scales used in the loss", 
+                        default=[0])
+    parser.add_argument('--renderer')
+    parser.add_argument('--renderer_rad', 
+                        type=float, 
+                        default=0.02)
+    parser.add_argument('--optical_flow_model', 
+                        dest='optical_flow_model')
+    parser.add_argument('--mesh_step_size', 
+                        type=int,
+                        default=30)
+    parser.add_argument('--depth_filter_kernel_size', 
+                        type=int,
+                        default=-1)
+    parser.add_argument('--num_ED_neighbors', 
+                        type=int, 
+                        default=8)
+    parser.add_argument('--num_neighbors', 
+                        type=int, 
+                        default=4)
+    parser.add_argument('--th_cosine_ang', 
+                        type=float,
+                        default=0.6) # 0.4
+    parser.add_argument('--th_dist',
+                        type=float,
+                        default=0.02) # 0.2
+    parser.add_argument('--th_conf', 
+                        type=float,
+                        help='Confidence threshold for stable surfels. If negative, confidence is not used.', 
+                        default=10)
+    parser.add_argument('--th_time_steps', 
+                        type=int,
+                        help='a surfel is unstable if it has not been updated for th_num_time_steps and has low confidence', 
+                        default=30)
+
+    # TRAINING options
+    parser.add_argument("--num_classes",
+                        type=int,
+                        help="number of semantic classes",
+                        default=3)
+    parser.add_argument("--min_depth",
+                        type=float,
+                        help="minimum depth",
+                        default=0.1)
+    parser.add_argument("--max_depth",
+                        type=float,
+                        help="maximum depth",
+                        default=100.0)
+    parser.add_argument("--depth_width_range",
+                        nargs="+", 
+                        type=float, 
+                        default=[0.02, 0.98])
+    parser.add_argument("--seed",
+                        type=int,
+                        help="seed",
+                        default=0)
+
+    # ABLATION options
+    parser.add_argument("--weights_init",
+                        type=str,
+                        help="pretrained or scratch",
+                        default="pretrained",
+                        choices=["pretrained", "scratch"])
+    parser.add_argument("--disable_merging_new_surfels",
+                        help="if set, after initialization, new surfels will not be added",
+                        action="store_true")
+
+
+    # CONFIDENCE options
+    parser.add_argument("--use_ssim_conf",
+                        help="if set, warp right image to the left view and use the ssim between the real and warp image as confidence",
+                        action="store_true")
+    parser.add_argument("--use_seman_conf",
+                        help="if set, warp right semantic map to the left view and compare the real and warp semantic map as confidence",
+                        action="store_true")
+
+    # EVALUATION options
+    parser.add_argument("--post_process",
+                        help="if set will perform the flipping post processing "
+                            "from the original monodepth paper",
+                        action="store_true")
+
 
     """
     Cost functions for LM optim.
     """
-    # For meshes.
     parser.add_argument('--m_point_plane', action='store_true', dest='m_point_plane')
     parser.add_argument('--m_point_point', action='store_true', dest='m_point_point')
     parser.add_argument('--m_pp_lambda', type=float, dest='m_pp_lambda', default=1.)
     parser.set_defaults(m_point_plane=False)
     parser.set_defaults(m_point_point=False)
-    parser.add_argument('--m_edge', action='store_true', dest='m_edge')
-    parser.add_argument('--m_edge_lambda', type=float, dest='m_edge_lambda', default=10.)
-    parser.set_defaults(m_edge=False)
-    parser.add_argument('--m_arap', action='store_true', dest='m_arap')
-    parser.add_argument('--m_arap_lambda', type=float, dest='m_arap_lambda', default=10.)
-    parser.set_defaults(m_arap=False)
-    parser.add_argument('--m_rot', action='store_true', dest='m_rot')
-    parser.add_argument('--m_rot_lambda', type=float, dest='m_rot_lambda', default=10.)
-    parser.set_defaults(m_rot=False)
-    # For surfels.
-    parser.add_argument('--sf_point_plane', action='store_true', dest='sf_point_plane')
-    parser.add_argument('--sf_pp_lambda', type=float, dest='sf_pp_lambda', default=1.)
-    parser.set_defaults(sf_point_plane=False)
-    parser.add_argument('--sf_corr', action='store_true', dest='sf_corr')
-    parser.add_argument('--sf_corr_lambda', type=float, dest='sf_corr_lambda', default=10.)
-    parser.set_defaults(sf_corr=False)
+    parser.add_argument('--mesh_edge', 
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--use_edge_ssim_hints', 
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--edge_ssim_hints_window', 
+                        type=int,
+                        default=6)
+    parser.add_argument('--mesh_edge_weight', 
+                        type=float, 
+                        dest='mesh_edge_weight', 
+                        default=10)
+    parser.add_argument('--mesh_face', 
+                        action='store_true', 
+                        dest='mesh_face',
+                        default=False)
+    parser.add_argument('--mesh_face_weight', 
+                        type=float, 
+                        dest='mesh_face_weight', 
+                        default=10)
+    parser.add_argument('--mesh_arap', 
+                        action='store_true', 
+                        dest='mesh_arap', 
+                        default=False)
+    parser.add_argument('--mesh_arap_weight', 
+                        type=float, 
+                        default=10)
+    parser.add_argument('--mesh_rot', 
+                        action='store_true', 
+                        dest='mesh_rot', 
+                        default=False)
+    parser.add_argument('--mesh_rot_weight', 
+                        type=float, 
+                        default=10.)
+    parser.add_argument("--bn_morph",
+                        help="if set, use border morphing loss",
+                        action="store_true")
+    parser.add_argument("--bn_morph_weight",
+                        type=float, 
+                        default=1e3)
+    parser.add_argument("--sf_bn_morph",
+                        help="if set, use border morphing loss",
+                        action="store_true")
+    parser.add_argument("--sf_bn_morph_weight",
+                        type=float, 
+                        default=10)
+    parser.add_argument('--sf_point_plane', 
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--sf_hard_seman_point_plane', 
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--sf_soft_seman_point_plane', 
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--icp_start_iter', 
+                        type=int, 
+                        default=0)
+    parser.add_argument('--use_color_hints', 
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--sf_point_plane_weight', 
+                        type=float, 
+                        dest='sf_point_plane_weight', 
+                        default=1.)
+    parser.add_argument('--sf_corr', 
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--sf_hard_seman_corr', 
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--sf_soft_seman_corr', 
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--sf_corr_use_keyframes', 
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--sf_corr_match_renderimg', 
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--sf_corr_weight', 
+                        type=float, 
+                        dest='sf_corr_weight', 
+                        default=1)
+    parser.add_argument('--sf_corr_huber_th', 
+                        type=float, 
+                        default=-1) # 1e-2
+    parser.add_argument('--sf_corr_loss_type', 
+                        default='point-plane')
+    parser.add_argument('--merge_sf_pointplane_corr', 
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--render_loss', 
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--render_loss_weight', 
+                        type=float, 
+                        default=1)
+    parser.add_argument('--depth_smooth_loss', 
+                        action='store_true', 
+                        default=False)
+    parser.add_argument('--depth_smooth_loss_weight', 
+                        type=float, 
+                        default=1)
 
-    """
-    Parameters for end-to-end.
-    """
-    parser.add_argument('--phase', action='store', dest='phase', default='test', help='train/test')
+    # End2end Options.
+    parser.add_argument('--phase', 
+                        dest='phase', 
+                        default='test', 
+                        choices=['train', 'test'])
 
     ## Loss functions for end-to-end.
     parser.add_argument('--e2e_sf_point_plane', action='store_true', dest='e2e_sf_point_plane')
@@ -91,14 +345,14 @@ def main():
     parser.add_argument('--save_tr_sample_freq', action='store', type=int, dest='save_tr_sample_freq', default=20, 
     help='Frequency to save sample results during training.')
 
-    # Parameters for RAFT (optical flow).
-    parser.add_argument('--optical_flow_method', dest='optical_flow_method')
-    parser.add_argument('--small', action='store_true', help='use small model')
-    parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
-    parser.add_argument('--optical_flow_pretrain_dir', dest='optical_flow_pretrain_dir', 
-        default='./RAFT/models/raft-small.pth')
-    parser.add_argument('--no_optical_flow_pretrain', action='store_false', dest='optical_flow_pretrain')
-    parser.set_defaults(optical_flow_pretrain=True)
+    # # Parameters for RAFT (optical flow).
+    # parser.add_argument('--optical_flow_method', dest='optical_flow_method')
+    # parser.add_argument('--small', action='store_true', help='use small model')
+    # parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
+    # parser.add_argument('--optical_flow_pretrain_dir', dest='optical_flow_pretrain_dir', 
+    #     default='./RAFT/models/raft-small.pth')
+    # parser.add_argument('--no_optical_flow_pretrain', action='store_false', dest='optical_flow_pretrain')
+    # parser.set_defaults(optical_flow_pretrain=True)
 
     # Parameters for PSMNet.
     parser.add_argument('--depth_est_method', dest='depth_est_method')
@@ -111,17 +365,33 @@ def main():
     parser.add_argument('--tracking_gt_file', dest='tracking_gt_file')
     # parser.add_argument('--gt_idx_file', dest='gt_idx_file')
 
+    # LOGGING options
+    parser.add_argument("--log_frequency",
+                        type=int,
+                        help="number of batches between each tensorboard log",
+                        default=30)
+    parser.add_argument('--nologfile', 
+                        action='store_true', 
+                        dest='nologfile', 
+                        default=False)
+
     # Choose modules for graph encoding.
     parser.add_argument('--graph_enc_method', dest='graph_enc_method', default='grid')
-
     args = parser.parse_args()
-    if args.phase == 'test':
-        args.sample_dir = os.path.join(args.sample_dir, f"model{args.mod_id}_exp{args.exp_id}")
-    model_args = init_params(args)
 
-    model = init_nets(model_args) # Init models /,& networks.
+    """
+    Fixed random seed.
+    """
+    seed = args.seed
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    cudnn.benchmark = False
 
-    prepare_folders(args)
+    models = init_nets(args) # Init models /,& networks.
+
+    # prepare_folders(args)
 
     ########################################################
 
@@ -131,22 +401,33 @@ def main():
     if args.method in ['super', 'seman-super'] or args.phase == 'test':
 
         # Init data loader.
-        testloader = init_dataset(model_args)
+        testloader = init_dataset(args, models=models)
 
         # init_surfels = True # True: Need to init the surfels with a depth map.
         iter_time_list = [] # List of time spent in each iteration.
 
-        # with output(initial_len=15, interval=0) as output_lines:
-        for data in testloader:
-            print(data["ID"].item())
+        prev_color = None
+        for inputs in testloader:
+            if prev_color is not None:
+                inputs[("prev_color", 0, 0)] = prev_color
 
-            model["super"](model, data)
+            models["super"](models, inputs)
+            prev_color = inputs[("color", 0, 0)]
 
-        write_args(os.path.join(args.sample_dir, "config.txt"), args)
+        mssim_mean = np.mean(models["super"].sf.mssim)
+        mssim_std = np.std(models["super"].sf.mssim)
+        models["super"].sf.logger.info(f"ssim mean: {mssim_mean}, ssim std: {mssim_std}")
+        if args.load_seman_gt:
+            if len(models['super'].sf.result_dice) > 0:
+                models["super"].sf.logger.info(f"mdice of {len(models['super'].sf.result_dice)} images: {np.mean(models['super'].sf.result_dice)}")
+            if len(models['super'].sf.result_jaccard) > 0:
+                models["super"].sf.logger.info(f"mjaccard (miou) of {len(models['super'].sf.result_jaccard)} images: {np.mean(models['super'].sf.result_jaccard)}")
+
+        # write_args(os.path.join(args.sample_dir, f"model{args.mod_id}_exp{args.exp_id}", "config.txt"), args)
         
-        if model_args['evaluate_tracking']:
-            with open(os.path.join(args.sample_dir, f"tracking_rst.npy"), 'wb') as f:
-                np.save(f, model["super"].sf.track_rsts)
+        if args.tracking_gt_file is not None:
+            with open(os.path.join(args.sample_dir, f"model{args.mod_id}_exp{args.exp_id}", f"tracking_rst.npy"), 'wb') as f:
+                np.save(f, models["super"].sf.track_rsts)
 
                 
     # # End-to-end training.

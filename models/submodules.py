@@ -1,58 +1,175 @@
 from torch.utils.data import DataLoader
 import torchvision.transforms as T
 
+from torchvision.models.optical_flow import raft_large, raft_small
+
 from graph.graph_encoder import *
 
 from super.super import *
 
 from renderer.renderer import *
+from seg.inference import *
+import json
 
 from utils.data_loader import *
 
+# from depth.psm.stackhourglass import PSMNet
+import depth.monodepth2.resnet_encoder as mono2_resnet_encoder
+import depth.monodepth2.depth_decoder as mono2_depth_decoder
 
-def init_params(args):
-    model_args = {
-        'data': args.data,
-        'data_dir': args.data_dir,
-        'height': args.height,
-        'width': args.width,
+import segmentation_models_pytorch as smp
 
-        'method': args.method,
-        'phase': args.phase,
-        'evaluate_tracking': args.tracking_gt_file is not None,
-        'tracking_gt_file': args.tracking_gt_file,
-        'sample_dir': args.sample_dir,
+# From "the edge of depth"
+# TODO move it
+class OccluMask(nn.Module):
+    def __init__(self, maxDisp = 21):
+        super(OccluMask, self).__init__()
+        self.maxDisp = maxDisp
+        self.pad = self.maxDisp
+        self.init_kernel()
+        self.boostfac = 400
+    def init_kernel(self):
+        convweights = torch.zeros(self.maxDisp, 1, 3, self.maxDisp + 2)
+        for i in range(0, self.maxDisp):
+            convweights[i, 0, :, 0:2] = 1/6
+            convweights[i, 0, :, i+2:i+3] = -1/3
+        self.conv = torch.nn.Conv2d(in_channels=1, out_channels=self.maxDisp, kernel_size=(3,self.maxDisp + 2), stride=1, padding=self.pad, bias=False)
+        self.conv.bias = nn.Parameter(torch.arange(self.maxDisp).type(torch.FloatTensor) + 1, requires_grad=False)
+        self.conv.weight = nn.Parameter(convweights, requires_grad=False)
 
-        # LM-optim cost function options.
-        'm-point-plane': [args.m_point_plane, args.m_pp_lambda],
-        'm-point-point': [args.m_point_point, args.m_pp_lambda],
-        'm-edge': [args.m_edge, args.m_edge_lambda],
-        'm-arap': [args.m_arap, args.m_arap_lambda],
-        'm-rot': [args.m_rot, args.m_rot_lambda],
-        'sf-point-plane': [args.sf_point_plane, args.sf_pp_lambda],
-        'sf-corr': [args.sf_corr, args.sf_corr_lambda],
 
-        # Parameters for end-to-end.
-        'e2e_sf_point_plane': [args.e2e_sf_point_plane, args.e2e_sf_pp_lambda],
-        'e2e_photo': [args.e2e_photo, args.e2e_photo_lambda],
-        'e2e_dy_photo': [args.e2e_dy_photo],
-        'e2e_feat': [args.e2e_feat, args.e2e_feat_lambda],
-        'e2e_dy_feat': [args.e2e_dy_feat],
-    }
+        self.detectWidth = 19  # 3 by 7 size kernel
+        self.detectHeight = 3
+        convWeightsLeft = torch.zeros(1, 1, self.detectHeight, self.detectWidth)
+        convWeightsRight = torch.zeros(1, 1, self.detectHeight, self.detectWidth)
+        convWeightsLeft[0, 0, :, :int((self.detectWidth + 1) / 2)] = 1
+        convWeightsRight[0, 0, :, int((self.detectWidth - 1) / 2):] = 1
+        self.convLeft = torch.nn.Conv2d(in_channels=1, out_channels=1,
+                                        kernel_size=(self.detectHeight, self.detectWidth), stride=1,
+                                        padding=[1, int((self.detectWidth - 1) / 2)], bias=False)
+        self.convRight = torch.nn.Conv2d(in_channels=1, out_channels=1,
+                                         kernel_size=(self.detectHeight, self.detectWidth), stride=1,
+                                         padding=[1, int((self.detectWidth - 1) / 2)], bias=False)
+        self.convLeft.weight = nn.Parameter(convWeightsLeft, requires_grad=False)
+        self.convRight.weight = nn.Parameter(convWeightsRight, requires_grad=False)
+    def forward(self, dispmap, bsline):
+        with torch.no_grad():
+            maskl = self.computeMask(dispmap, direction='l')
+            maskr = self.computeMask(dispmap, direction='r')
+            lind = bsline < 0
+            rind = bsline > 0
+            mask = torch.zeros_like(dispmap)
+            mask[lind,:, :, :] = maskl[lind,:, :, :]
+            mask[rind, :, :, :] = maskr[rind, :, :, :]
+            return mask
 
-    if args.data == 'super':
-        model_args['CamParams'] = OldSuPerParams
+    def computeMask(self, dispmap, direction):
+        with torch.no_grad():
+            width = dispmap.shape[3]
+            if direction == 'l':
+                output = self.conv(dispmap)
+                output = torch.clamp(output, max=0)
+                output = torch.min(output, dim=1, keepdim=True)[0]
+                output = output[:, :, self.pad - 1:-(self.pad - 1):, -width:]
+                output = torch.tanh(-output)
+                mask = (output > 0.05).float()
+            elif direction == 'r':
+                dispmap_opp = torch.flip(dispmap, dims=[3])
+                output_opp = self.conv(dispmap_opp)
+                output_opp = torch.clamp(output_opp, max=0)
+                output_opp = torch.min(output_opp, dim=1, keepdim=True)[0]
+                output_opp = output_opp[:, :, self.pad - 1:-(self.pad - 1):, -width:]
+                output_opp = torch.tanh(-output_opp)
+                mask = (output_opp > 0.05).float()
+                mask = torch.flip(mask, dims=[3])
+            return mask
 
-    return model_args
-
-def init_nets(model_args: dict,):
-    model = {}
-    if model_args['method'] == 'super':
-        model["super"] = SuPer(model_args)
-        model["mesh_encoder"] = DirectDeformGraph(model_args).to(dev)
-        model["renderer"] =  Pulsar().to(dev) # Projector().to(dev)
+def init_nets(opt):
+    models = {}
+    
+    if opt.method in ['super', 'seman-super']:
+        models["super"] = SuPer(opt)
+        models["mesh_encoder"] = DirectDeformGraph(opt)
+    
+    if opt.renderer is not None:
+        if opt.renderer == 'matrix_transform':
+            models["renderer"] =  Projector(method="direct")
+        elif opt.renderer == 'opencv':
+            models["renderer"] =  Projector(method="opencv")
+        elif opt.renderer == 'pulsar':
+            models["renderer"] =  Pulsar()
+        elif opt.renderer in ['grid_sample', 'warp']:
+            models["renderer"] =  Pulsar()
+        else:
+            assert False, "This renderer is not available."
         
-    return model
+    if opt.num_layers > 0:
+        models["encoder"] = mono2_resnet_encoder.ResnetEncoder(
+            opt.num_layers, opt.weights_init == "pretrained")
+        # self.parameters_to_train += list(self.models["encoder"].parameters())
+        
+        if opt.pretrained_encoder_checkpoint_dir is not None:
+             models["encoder"] = load_checkpoints(models["encoder"], 
+                    opt.pretrained_encoder_checkpoint_dir, model_key="encoder")
+
+    if opt.depth_model is not None:
+        if opt.depth_model == 'monodepth2_stereo':
+            models["depth"] = mono2_depth_decoder.DepthDecoder(
+                opt, models["encoder"].num_ch_enc, opt.scales)
+
+        # elif opt.depth_model == 'psm':
+        #     models["depth"] = PSMNet(opt)
+            
+        if opt.pretrained_depth_checkpoint_dir is not None:
+            models["depth"] = load_checkpoints(models["depth"], 
+                opt.pretrained_depth_checkpoint_dir, model_key="depth")
+
+    if opt.seg_model is not None and not opt.load_seman:
+        if opt.seg_model == 'deeplabv3':
+            models["seman"] = smp.DeepLabV3Plus(
+                encoder_name="resnet18",
+                in_channels=3,
+                classes=opt.num_classes
+            )
+
+        elif opt.seg_model == 'unet':
+            models["seman"] = smp.Unet(
+                encoder_name="resnet18",
+                in_channels=3,
+                classes=opt.num_classes
+            )
+
+        elif opt.seg_model == 'unet++':
+            models["seman"] = smp.UnetPlusPlus(
+                encoder_name="resnet18",
+                in_channels=3,
+                classes=opt.num_classes
+            )
+        
+        elif opt.seg_model == 'manet':
+            models["seman"] = smp.MAnet(
+                encoder_name="resnet18",
+                in_channels=3,
+                classes=opt.num_classes
+            )
+        
+        if opt.pretrained_seg_checkpoint_dir is not None:
+            models["seman"] = load_checkpoints(models["seman"], opt.pretrained_seg_checkpoint_dir,
+                                                model_key='state_dict')
+            models["seman"].eval()
+
+    if opt.optical_flow_model == 'raft_small':
+        models["optical_flow"] = raft_small(pretrained=True, progress=True)
+    elif opt.optical_flow_model == 'raft_large':
+        models["optical_flow"] = raft_large(pretrained=True, progress=True)
+
+    # if opt.bn_morph:
+    #     models["OccluMask"] = OccluMask().cuda()
+
+    for key in models.keys():
+        models[key].cuda()
+    
+    return models
 
     # nets = {}
     # if args.graph_enc_method == 'grid':
@@ -90,6 +207,17 @@ def init_nets(model_args: dict,):
     #         depth_est_net.model.load_state_dict(
     #             torch.load(f"{args.depth_est_method}_exp{args.mod_id}_end.pt"))
     #     nets["depth"] = depth_est_net
+
+def load_checkpoints(model, model_path, model_key=None):
+    if os.path.exists(model_path):
+        state = torch.load(model_path)
+        
+        if isinstance(state, dict):
+            assert model_key is not None, "A model_key is needed to extract model parameters."
+            model.load_state_dict(state[model_key], strict=False)
+            print(f"Restored model with key {model_key}")
+            
+    return model
 
 def prepare_folders(args: dict,):
     """
@@ -136,10 +264,12 @@ def prepare_folders(args: dict,):
     #         if not os.path.exists(folder):
     #             os.makedirs(folder)
 
-def init_dataset(model_args: dict,):
-    if model_args['phase'] == 'train':
-        pass
+def init_dataset(opts, models=None):
+    if opts.phase == 'train':
+        assert False, "TODO: Write the code."
+    
     else:
-        testset = SuPerDataset(model_args, normalize)
-        testloader = DataLoader(testset, batch_size=1, shuffle=False)
+        # testset = SuPerDataset(opts, normalize, models=models)
+        testset = SuPerDataset(opts, T.ToTensor(), models=models)
+        testloader = DataLoader(testset, 1, shuffle=False)
         return testloader

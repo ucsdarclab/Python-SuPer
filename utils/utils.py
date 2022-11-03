@@ -1,7 +1,12 @@
 import os
+import sys
 import shutil
+import logging
 from typing import Any, BinaryIO, List, Optional, Tuple, Union
 from PIL import Image, ImageColor, ImageDraw, ImageFont
+
+import torch
+import torch.nn as nn
 
 from pytorch3d.ops import (
     ball_query,
@@ -15,8 +20,8 @@ def get_grid_coords(h, w, dtype=long_, batch_size=None, stack_dim=None):
     """
     Get grids of x,y coordinates.
     """
-    u = torch.arange(w, dtype=dtype, device=dev)
-    v = torch.arange(h, dtype=dtype, device=dev)
+    u = torch.arange(w, dtype=dtype).cuda()
+    v = torch.arange(h, dtype=dtype).cuda()
     u, v = torch.meshgrid(u, v, indexing='xy')
 
     if batch_size is not None:
@@ -96,7 +101,7 @@ def draw_keypoints(
 
     return torch.from_numpy(np.array(img_to_draw)).permute(2, 0, 1).to(dtype=torch.uint8)
         
-def blur_image(imgs, method="pyt-gauss"):
+def blur_image(imgs, method="pyt-gauss", kernel=15):
     """
     Smooth images.
     Input: imgs [H, W], [H, W, C], [B, H, W], or [B, H, W, C], B: batch size, C: channel.
@@ -130,8 +135,8 @@ def blur_image(imgs, method="pyt-gauss"):
         else:
             assert imgs.dim() == 4
 
-        blur = T.Compose([T.GaussianBlur(15)])
-        imgs = blur(imgs).type(fl64_)
+        blur = T.Compose([T.GaussianBlur(kernel)])
+        imgs = blur(imgs)
 
         if dim == 2:
             imgs = imgs[0,0]
@@ -146,8 +151,11 @@ def blur_image(imgs, method="pyt-gauss"):
 def torch_to_numpy(inputs):
     return inputs.detach().cpu().numpy()
 
-def numpy_to_torch(inputs, dtype=fl32_, device=dev):
-    return torch.as_tensor(inputs, dtype=dtype, device=device)
+def numpy_to_torch(inputs, dtype=fl32_, to_gpu=True):
+    if to_gpu:
+        return torch.as_tensor(inputs, dtype=dtype).cuda()
+    else:
+        return torch.as_tensor(inputs, dtype=dtype)
 
 def torch_inner_prod(a, b, dim=-1, keepdim=False):
     """
@@ -158,97 +166,237 @@ def torch_inner_prod(a, b, dim=-1, keepdim=False):
 def torch_distance(a,b,keepdim=False):
     return torch.linalg.norm(a-b, dim=-1, keepdim=keepdim)
 
-def torch_delete(inputs, indexs):
-    mask = torch.ones(len(inputs), dtype=bool, device=dev)
-    mask[indexs] = False
-    return inputs[mask]
+def torch_sq_distance(a, b, dim=-1, keepdim=False):
+    return torch.pow(a - b, 2).sum(dim)
 
-# Reset contents in folder "foldername"
-def reset_folder(foldername):
+# def torch_delete(inputs, indexs):
+#     mask = torch.ones(len(inputs), dtype=bool).cuda()
+#     mask[indexs] = False
+#     return inputs[mask]
 
-    if os.path.exists(foldername):
-        shutil.rmtree(foldername)
-    os.makedirs(foldername)
+# # Reset contents in folder "foldername"
+# def reset_folder(foldername):
+
+#     if os.path.exists(foldername):
+#         shutil.rmtree(foldername)
+#     os.makedirs(foldername)
 
 # point cloud to coordinates on image plane (y*HEIGHT+x)
 # if vis_only==True, only keeps the points that are visable after projection
-def pcd2depth(CamParams, pcd, round_coords=True, depth_sort=False, conf_sort=False, conf=None, valid_margin=0):
+# def pcd2depth(inputs, pcd, round_coords=True, conf_sort=False, conf=None, valid_margin=0):
+def pcd2depth(inputs, pcd, round_coords=True, valid_margin=0):
 
     X = pcd[...,0]
-    Y = - pcd[...,1]
-    Z = - (pcd[...,2] + 1e-8) # Z > 0
+    Y = pcd[...,1]
+    Z = (pcd[...,2] + 1e-8)
     
-    u_ = X * CamParams.fx / Z + CamParams.cx
-    v_ = Y * CamParams.fy / Z + CamParams.cy
+    u_ = X * inputs["fx"] / Z + inputs["cx"]
+    v_ = Y * inputs["fy"] / Z + inputs["cy"]
     u = torch.round(u_).long()
     v = torch.round(v_).long()
-    coords = v * CamParams.WIDTH + u
-    valid_proj = (v >= valid_margin) & (v < CamParams.HEIGHT-1-valid_margin) & \
-        (u >= valid_margin) & (u < CamParams.WIDTH-1-valid_margin)
+    coords = v * inputs["width"] + u
+    valid_proj = (v >= valid_margin) & (v < inputs["height"]-1-valid_margin) & \
+        (u >= valid_margin) & (u < inputs["width"]-1-valid_margin)
 
-    if depth_sort or conf_sort:
+    # if depth_sort or conf_sort:
 
-        # Keep only the valid projections.
-        Z = Z[valid_proj]
-        coords = coords[valid_proj]
-        indicies = valid_proj.nonzero(as_tuple=True)[0]
+    #     # Keep only the valid projections.
+    #     Z = Z[valid_proj]
+    #     coords = coords[valid_proj]
+    #     indicies = valid_proj.nonzero(as_tuple=True)[0]
 
-        # Sort based on depth or confidence.
-        if depth_sort:
-            _, sort_indices = torch.sort(Z) # Z(depth) from small to large.
-        elif conf_sort:
-            _, sort_indices = torch.sort(conf[valid_proj])
-        coords, indicies = coords[sort_indices], indicies[sort_indices]
+    #     # Sort based on depth or confidence.
+    #     if depth_sort:
+    #         _, sort_indices = torch.sort(Z) # Z(depth) from small to large.
+    #     elif conf_sort:
+    #         _, sort_indices = torch.sort(conf[valid_proj])
+    #     coords, indicies = coords[sort_indices], indicies[sort_indices]
 
+    #     # Sort based on coordinate.
+    #     coords, sort_indices = torch.sort(coords, stable=True)
+    #     indicies = indicies[sort_indices]
+    #     coords, counts = torch.unique_consecutive(coords, return_counts=True)
+    #     counts = torch.cat([torch.tensor([0]).cuda(), \
+    #         torch.cumsum(counts[:-1], dim=0)])
+    #     indicies = indicies[counts]
 
-        # Sort based on coordinate.
-        coords, sort_indices = torch.sort(coords, stable=True)
-        indicies = indicies[sort_indices]
-        coords, counts = torch.unique_consecutive(coords, return_counts=True)
-        counts = torch.cat([torch.tensor([0], device=dev), \
-            torch.cumsum(counts[:-1], dim=0)])
-        indicies = indicies[counts]
+    #     if round_coords:
+    #         return v[indicies], u[indicies], coords, indicies
+    #     else:
+    #         return v_[indicies], u_[indicies], coords, indicies
+    # else:
+    # if round_coords:
+    #     return v, u, coords[valid_proj], valid_proj
+    # else:
+    #     return v_, u_, coords[valid_proj], valid_proj
 
-        if round_coords:
-            # return v[indicies].long(), u[indicies].long(), coords, indicies
-            return v[indicies], u[indicies], coords, indicies
-        else:
-            return v_[indicies], u_[indicies], coords, indicies
-    
+    if round_coords:
+        return v, u, coords, valid_proj
     else:
-        if round_coords:
-            return v, u, coords[valid_proj], valid_proj#.nonzero(as_tuple=True)[0]
-        else:
-            return v_, u_, coords[valid_proj], valid_proj#.nonzero(as_tuple=True)[0]
+        return v_, u_, coords, valid_proj
 
 # Convert depth map to point cloud.
-def depth2pcd(CamParams, Z):
+def depth2pcd(inputs, Z):
 
     Z = Z.squeeze(1)
     b, h, w = Z.size()
     u, v = get_grid_coords(h, w, batch_size=b)
     
-    X = (u - CamParams.cx) * Z / CamParams.fx
-    Y = (v - CamParams.cy) * Z / CamParams.fy
-    return X, Y, Z
+    X = (u - inputs["cx"]) * Z / inputs["fx"]
+    Y = (v - inputs["cy"]) * Z / inputs["fy"]
+    return X.type(fl32_), Y.type(fl32_), Z
 
-def find_knn(p1, p2, k=20, radius=0.5, method="knn"):
-    if method == "ball_query":
-        dists, idx, _ = ball_query(p1.unsqueeze(0), p2.unsqueeze(0), K=k, radius=radius)
-        dists = dists[0]
-        idx = idx[0]
+def find_knn(points1, points2, num_classes=-1, seman1=None, seman2=None, k=20, radius=0.5, method="knn"):
+    def group_knn(p1, p2):
+        if method == "ball_query":
+            dists, idx, _ = ball_query(p1.unsqueeze(0), p2.unsqueeze(0), K=k, radius=radius)
+        elif method == "knn":
+            dists, idx, _ = knn_points(p1.unsqueeze(0), p2.unsqueeze(0), K=k)
+        return torch.sqrt(dists[0]), idx[0]
 
-    elif method == "knn":
-        dists, idx, _ = knn_points(p1.unsqueeze(0), p2.unsqueeze(0), K=k)
-        dists = dists[0]
-        idx = idx[0]
+    if num_classes <= 0:
+        return group_knn(points1, points2)
+    else:
+        N1, N2 = len(points1), len(points2)
+        points1_ids = torch.arange(N1)
+        points2_ids = torch.arange(N2)
+        dists = 1e8 * torch.ones((N1, k), dtype=fl64_).cuda()
+        idx = - torch.ones((N1, k), dtype=long_).cuda()
+        for class_id in range(num_classes):
+            val1 = seman1==class_id
+            p1 = points1[val1]
 
-    return dists, idx
+            val2 = (seman2==class_id).nonzero(as_tuple=True)[0]
+            p2 = points2[val2]
 
-def write_args(filename, args):
-    with open(filename, 'w') as f:
-        for arg in vars(args):
-            f.write(arg)
-            f.write(':  ')
-            f.write(str(getattr(args, arg)))
-            f.write('\n')
+            if len(p1) == 0 and len(p2) == 0:
+                continue
+            assert len(p1) > 0 and len(p2) >= k
+            _dists_, _idx_ = group_knn(p1, p2)
+            dists[val1] = _dists_
+            idx[val1] = val2[_idx_]
+
+        return dists, idx
+
+# def write_args(filename, args):
+#     with open(filename, 'w') as f:
+#         for arg in vars(args):
+#             f.write(arg)
+#             f.write(':  ')
+#             f.write(str(getattr(args, arg)))
+#             f.write('\n')
+
+def KLD(P, Q, eps=1e-13, dim=-1):
+    """
+    return KL(P||Q)
+    P: target
+    Q: input
+    """
+    return (P * (P / (Q + eps) + eps).log()).sum(dim)
+
+def JSD(P, Q, eps=1e-13, dim=-1):
+    M = 0.5 * (P + Q)
+    return 0.5 * (KLD(P, M, eps=eps, dim=dim) + KLD(Q, M, eps=eps, dim=dim))
+
+def pyt_erode(x, kernel=11):
+    eroder = nn.MaxPool2d(kernel, stride=1, padding=int((kernel-1)/2))
+    x = 1 - eroder(1 - x)
+    return x
+
+def pyt_dilate(x, kernel=11):
+    dilater = nn.MaxPool2d(kernel, stride=1, padding=int((kernel-1)/2))
+    x = dilater(x)
+    return x
+
+def erode_dilate_seg(seg, kernel=31):
+    valid_seg = torch.ones(seg.size(), dtype=bool_).cuda()
+    
+    for class_id in torch.unique(seg):
+        class_seg = torch.zeros_like(seg)
+        class_seg[seg == class_id] = 1
+        valid_seg &= class_seg == pyt_dilate(pyt_erode(class_seg.type(fl32_)))
+
+    return valid_seg
+
+class CustomLogManager:
+    '''
+    To use this, 
+    1. import the instance `custom_log_manager` in your main script and `setup`
+    2. import the instance `custom_log_manager` in any `.py` file you would like logging,
+    and `logger = custom_log_manager.get_logger(NAME, level=LEVEL)`, and use `logger.info`
+    or `logger.warn` to replace all `print` statements.
+    * do NOT setup your custom_log_manager more than once.
+    '''
+    def __init__(self):
+        self._loggers = []
+        self.file_handler = None
+        self.console_handler = None
+        pass
+
+    def setup(self, to_file: bool=False, log_prefix: str=None, time_stamp=None, logdir: str='logs'):
+        '''
+        Setup handlers depending on the given parameters. 
+        When `to_file==True` and `log_prefix==None`, a default prefix 'log' will be given.
+        `log_prefix` does not do anything when `to_file` is False.
+        `time_stamp` will be appended at the end of the file name if not None.
+        Examples:
+        ```
+        import datetime
+        from utils import custom_log_manager
+        time_stamp = datetime.datetime.now().strftime("%y-%m-%d--%H-%M-%S")
+        custom_log_manager.setup(to_file=True, time_stamp=time_stamp)
+        logger = custom_log_manager.get_logger('main')
+        ```
+        or
+        ```
+        custom_log_manager.setup(to_file=True, log_prefix=f'train_exp{mod_id}', time_stamp=time_stamp)
+        logger = custom_log_manager.get_logger('evaluate')
+        ```
+        '''
+        if to_file and log_prefix is None: 
+            log_prefix = 'log'
+        self.logdir = logdir
+        self.to_file = to_file
+        self.time_stamp = time_stamp
+        if self.to_file:
+            if self.time_stamp is not None:
+                log_fn = f"{log_prefix}-{self.time_stamp}.txt"
+            else:
+                log_fn = f"{log_prefix}.txt"
+        self.fmt = logging.Formatter(
+            fmt="%(asctime)s %(name)-12s %(levelname)-8s %(message)s",
+            datefmt="%m-%d %H:%M:%S")
+        if self.to_file:
+            os.makedirs(self.logdir, exist_ok=True)
+            log_full_fn = os.path.join(self.logdir, log_fn)
+            self.file_handler = logging.FileHandler(log_full_fn)
+            self.file_handler.setLevel(logging.DEBUG)
+            self.file_handler.setFormatter(self.fmt)
+        self.console_handler = logging.StreamHandler(sys.stdout)
+        self.console_handler.setLevel(logging.DEBUG)
+        self.console_handler.setFormatter(self.fmt)
+
+        # Some loggers may have been added before setup in the main file.
+        for logger in self._loggers:
+            if self.console_handler is not None:
+                logger.addHandler(self.console_handler)
+            if self.file_handler is not None:
+                logger.addHandler(self.file_handler)
+            
+    
+    def get_logger(self, name: str, level=logging.DEBUG):
+        '''
+        The `name` will be the second element in a log line. 
+        Usually used to identify which function/namespace/file/etc. is logging.
+        You can set it to any arbitrary string.
+        '''
+        logger = logging.getLogger(name)
+        logger.setLevel(level)
+        if self.console_handler is not None:
+            logger.addHandler(self.console_handler)
+        if self.file_handler is not None:
+            logger.addHandler(self.file_handler)
+        self._loggers.append(logger)
+        return logger
+
+custom_log_manager = CustomLogManager()

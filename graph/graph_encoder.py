@@ -1,6 +1,6 @@
 from collections import namedtuple
 
-from pytorch3d.structures import Meshes
+import open3d as o3d
 
 import torch
 import torch.nn as nn
@@ -44,51 +44,322 @@ from super.loss import *
 from utils.config import *
 from utils.utils import *
 
+from bnmorph.layers import grad_computation_tools
 
 class DirectDeformGraph(nn.Module):
     '''
     Directly get the ED node graph through gridding or random (uniform) selection.
     '''
 
-    def __init__(self, model_args) -> None:
+    def __init__(self, opt) -> None:
         super(DirectDeformGraph, self).__init__()
-        self.model_args = model_args
+        self.opt = opt
 
-    def forward(self, data, sample_method='grid'):
+        # if self.opt.method == "seman-super":
+        #     self.tool = grad_computation_tools(batch_size=self.opt.batch_size, height=self.opt.height,
+        #                                        width=self.opt.width).cuda()
+
+    def select_ED_nodes(self, points, norms, seman_conf=None, downsample_params=None, method='ball_pivoting'):
+        if method=='ball_pivoting':
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points.cpu().numpy())
+            pcd.normals = o3d.utility.Vector3dVector(norms.cpu().numpy())
+            if seman_conf is not None:
+                pcd.colors = o3d.utility.Vector3dVector(seman_conf.cpu().numpy())
+            
+            if downsample_params is not None:
+                for _downsample_params_ in downsample_params:
+                    voxel_size, nb_neighbors, std_ratio = _downsample_params_
+                    pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
+                    _, ind = pcd.remove_statistical_outlier(nb_neighbors=int(nb_neighbors), std_ratio=std_ratio)
+                    pcd = pcd.select_by_index(ind)
+
+            points = numpy_to_torch(np.asarray(pcd.points), dtype=fl64_)
+            norms = numpy_to_torch(np.asarray(pcd.normals), dtype=fl64_)
+            return pcd, points, norms
+
+    def init_ED_nodes(self, inputs, data, 
+    candidates, candidates_norms, candidates_seman=None, candidates_seman_conf=None,
+    boundary_pts=None, boundary_rad=30,
+    downsample_params=None, ball_piv_radii = [0.08, 0.1, 0.15], edge_identify_method='grid_mesh'):
+
+        # ### Alpha shapes ###
+        # pcd = o3d.geometry.PointCloud()
+        # pcd.points = o3d.utility.Vector3dVector(candidates.cpu().numpy())
+        
+        # pcd = pcd.voxel_down_sample(voxel_size=0.02)
+        # _, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=0.2)
+        # pcd = pcd.select_by_index(ind)
+        # pcd = pcd.voxel_down_sample(voxel_size=0.08)
+        # _, ind = pcd.remove_statistical_outlier(nb_neighbors=40, std_ratio=0.5)
+        # pcd = pcd.select_by_index(ind)
+
+        # alpha = 0.1
+        # rec_mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd, alpha)
+        # rec_mesh.compute_vertex_normals()
+        # ### Alpha shapes ###
+        
+        # ### Ball pivot ###
+        # if candidates_seman is None:
+        #     pcd, points, norms = self.select_ED_nodes(candidates, candidates_norms, downsample_params=downsample_params)
+        #     seman_conf = numpy_to_torch(np.asarray(pcd.colors))
+        # else:
+        #     pcd = o3d.geometry.PointCloud()
+        #     points = []
+        #     norms = []
+        #     for class_id in range(candidates_seman_conf.size(1)):
+        #         candidates_ids = candidates_seman == class_id
+        #         _pcd_, _points_, _norms_ = self.select_ED_nodes(candidates[candidates_ids], candidates_norms[candidates_ids], 
+        #                                     seman_conf=candidates_seman_conf[candidates_ids], downsample_params=downsample_params)
+        #         pcd += _pcd_
+        #         points.append(_points_)
+        #         norms.append(_norms_)
+        #     points = torch.cat(points, dim=0)
+        #     norms = torch.cat(norms, dim=0)
+        #     seman_conf = numpy_to_torch(np.asarray(pcd.colors))
+        # ### Ball pivot ###
+
+        # ## grid ###
+        # step = 30
+        # ids = data.index_map[::step, ::step]
+        # ids = ids[ids >= 0]
+        # points = candidates[ids]
+        # norms = candidates_norms[ids]
+        # seman_conf = candidates_seman_conf[ids]
+
+        # pcd = o3d.geometry.PointCloud()
+        # pcd.points = o3d.utility.Vector3dVector(points.cpu().numpy())
+        # pcd.normals = o3d.utility.Vector3dVector(norms.cpu().numpy())
+        # pcd.colors = o3d.utility.Vector3dVector(seman_conf.cpu().numpy())
+        # ## grid ###
+
+        if edge_identify_method == 'ball_pivoting':
+            rec_mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+                pcd, o3d.utility.DoubleVector(ball_piv_radii))
+
+            # Fliter isolated points.
+            rec_mesh.compute_adjacency_list()
+            val_points = torch.tensor([len(adjacency) >= 3 for adjacency in rec_mesh.adjacency_list])
+            radii = []
+            for k, adjacency in enumerate(rec_mesh.adjacency_list):
+                if val_points[k]:
+                    adjacency = np.array(list(adjacency))
+                    adjacency = adjacency[val_points[adjacency]]
+                    if len(adjacency) >= 3:
+                        radii.append(torch.cdist(points[k][None, ...], points[adjacency]).mean())
+                    else:
+                        val_points[k] = False
+            radii = torch.stack(radii)
+            points = points[val_points]
+            norms = norms[val_points]
+            seman_conf = seman_conf[val_points]
+        
+            # edge_index: Map from old index to new index
+            id_map = -torch.ones(len(val_points), dtype=long_)
+            id_map[val_points] = torch.arange(torch.count_nonzero(val_points))
+            triangles = numpy_to_torch(np.asarray(rec_mesh.triangles), dtype=long_)
+            triangles = id_map[triangles]
+            triangles = triangles[~torch.any(triangles == -1, dim=1)]
+            edge_index = torch.cat([triangles[:,0:2], triangles[:,1:]], dim=0)
+            edge_index = torch.unique(torch.sort(edge_index, dim=1)[0], dim=0).permute(1, 0)
+
+            triangles_areas = torch.cross(points[triangles[:, 1]] - points[triangles[:, 0]],
+                                    points[triangles[:, 2]] - points[triangles[:, 0]],
+                                    dim=1)
+            triangles_areas = 0.5 * torch.sqrt((triangles_areas**2).sum(1) + 1e-13)
+            # triangles_areas = 0.25 * (triangles_areas**2).sum(1)
+        
+        elif edge_identify_method == 'knn':
+            dists, edge_index = find_knn(points, points, k = self.opt.num_ED_neighbors + 1)
+            radii = torch.sqrt(dists[:, 1:]).mean(1)
+            edge_index = torch.stack([
+                            torch.flatten(torch.arange(len(points))[..., None].repeat(1, self.opt.num_ED_neighbors)).cuda(), 
+                            torch.flatten(edge_index[:, 1:])]
+                            , dim=0)
+            triangles = None
+            triangles_areas = None
+        
+        elif edge_identify_method == 'grid_mesh':
+            if self.opt.hard_seman and False:
+                seman_map = - torch.ones_like(data.index_map)
+                seman_map[data.index_map >= 0] = data.seman.to(data.index_map.device)
+                val_points = []
+                edge_index = []
+                triangles = []
+                id_offset = 0
+                for class_id in range(self.opt.num_classes):
+                    step_scale = 1.0
+                    while True:
+                        if torch.count_nonzero(seman_map == class_id) == 0:
+                            break
+                            
+                        _val_points_, _edge_index_, _triangles_ = init_graph(self.opt, seman_map == class_id, 
+                                                                             step=int(self.opt.mesh_step_size/step_scale))
+                        if torch.count_nonzero(_val_points_) < 4 * self.opt.num_ED_neighbors:
+                            step_scale += 1.
+                        else:
+                            class_id_map = data.index_map[_val_points_]
+                            val_points.append(class_id_map)
+                            edge_index.append(_edge_index_ + id_offset)
+                            triangles.append(_triangles_ + id_offset)
+                            id_offset += len(class_id_map)
+                            break
+                val_points = torch.cat(val_points)
+                edge_index = torch.cat(edge_index, dim=1)
+                triangles = torch.cat(triangles, dim=1)
+            else:
+                val_points, edge_index, triangles = init_graph(self.opt, data.index_map >= 0, step=self.opt.mesh_step_size)
+                val_points = data.index_map[val_points]
+
+            points = candidates[val_points]
+            norms = candidates_norms[val_points]
+            seman_conf = candidates_seman_conf[val_points]
+            seman = torch.argmax(seman_conf, dim=1)
+
+            # If hard_seman, delete the boundary edges.
+            if self.opt.hard_seman and (self.opt.mesh_edge or self.opt.mesh_face):
+                inside_edges = seman[edge_index[0]] == seman[edge_index[1]]
+                edge_index = torch.stack([edge_index[0][inside_edges], edge_index[1][inside_edges]], dim=0)
+
+                inside_triangles = (seman[triangles[0]] == seman[triangles[1]]) & (seman[triangles[0]] == seman[triangles[2]])
+                triangles = torch.stack([triangles[0][inside_triangles], 
+                                         triangles[1][inside_triangles], 
+                                         triangles[2][inside_triangles]], dim=0)
+
+            edges_lens = torch.norm(points[edge_index[0]] - points[edge_index[1]], dim=1)
+            radii = []
+            for k in range(len(points)):
+                radii.append(edges_lens[torch.any(edge_index == k, dim=0)].mean()) # Old setup: 0.6 * mean
+            radii = torch.stack(radii)
+
+            triangles_areas = torch.cross(points[triangles[1]] - points[triangles[0]],
+                                    points[triangles[2]] - points[triangles[0]],
+                                    dim=1)
+            triangles_areas = 0.5 * torch.sqrt((triangles_areas**2).sum(1) + 1e-13)
+
+        if boundary_pts is not None:
+            y, x, _, _ = pcd2depth(inputs, points, round_coords=False)
+            pts = torch.stack([x, y], dim=1).type(fl64_)
+            dists, _ = find_knn(pts, boundary_pts, k=1)
+            isBoundary = dists[:, 0] <= boundary_rad
+        else:
+            isBoundary = None
+
+        return points, norms, radii, edge_index, triangles, triangles_areas, isBoundary, seman, seman_conf
+
+    def forward(self, inputs, data):
 
         points = data.points
         norms = data.norms
-        valid = data.valid.view(self.model_args['CamParams'].HEIGHT, self.model_args['CamParams'].WIDTH)
+        valid = data.valid.view(inputs["height"], inputs["width"])
 
-        if sample_method: step = 28
-        elif sample_method == 'uniform': step = 4
-        isED, edge_index, face_index = init_graph(valid, step=step)
-        index_map_valid = isED & valid # TODO
-        isED = isED[valid]
-        ED_points = points[isED]
-        edges_lens = torch_distance(ED_points[edge_index[:,0]], ED_points[edge_index[:,1]])
-        deform_mesh = Meshes(verts=[ED_points], faces=[torch.t(face_index)])
-        faces_areas = deform_mesh.faces_areas_packed()
+        # Find ED nodes near the boundary.
+        # if self.opt.method == "seman-super" and False:
+        #     ED_points = []
+        #     ED_norms = []
+        #     radii = []
+        #     edge_index = []
+        #     edge_index_offset = 0
+        #     isBoundary = []
+        #     seman = []
+        #     seman_conf = []
+        #     downsample_params=[
+        #         [(0.02, 50, 0.5), (0.05, 20, 1.), (0.1, 20, 1.)],
+        #         [(0.02, 50, 0.5), (0.05, 20, 1.), (0.1, 20, 1.)],
+        #         [(0.02, 50, 0.5), (0.05, 20, 1.), (0.1, 20, 1.)]]
+        #     ball_piv_radii = [
+        #         [0.08, 0.1, 0.15],
+        #         [0.08, 0.1, 0.15],
+        #         [0.08, 0.1, 0.15]]
+        #     # [(0.02, 40, 0.2), (0.05, 20, 1.)] [0.005, 0.02, 0.04, 0.06]
+        #     kernels = [3, 3, 3]
+        #     for class_id in range(self.opt.num_classes):
+        #         seman_grad_bin = self.tool.get_semanticsEdge(
+        #             inputs[("seman", 0)], foregroundType=[class_id],
+        #             erode_foreground=True, kernel_size=kernels[class_id])
+        #         edge_y, edge_x = seman_grad_bin[0,0].nonzero(as_tuple=True)
+        #         edge_pts = torch.stack([edge_x, edge_y], dim=1).type(fl64_)
 
+        #         candidates_ids = data.seman == class_id
+        #         _ED_points_, _ED_norms_, _radii_, _edge_index_, _isBoundary_, _, _seman_conf_ = self.init_ED_nodes(inputs, data, 
+        #             points[candidates_ids], norms[candidates_ids], 
+        #             candidates_seman_conf=data.seman_conf[candidates_ids],
+        #             boundary_pts=edge_pts, boundary_rad=40,
+        #             downsample_params=downsample_params[class_id], ball_piv_radii=ball_piv_radii[class_id])
+        #             # boundary_rad=rads[class_id][0], inside_rad=rads[class_id][1], #boundary_pts=(edge_x, edge_y), 
+        #         ED_points.append(_ED_points_)
+        #         ED_norms.append(_ED_norms_)
+        #         radii.append(_radii_)
+        #         edge_index.append(_edge_index_+edge_index_offset)
+        #         edge_index_offset += len(_ED_points_)
+        #         isBoundary.append(_isBoundary_)
+        #         seman.append(class_id * torch.ones(len(_ED_points_), dtype=long_).cuda())
+        #         seman_conf.append(_seman_conf_)
+
+        #     ED_points = torch.cat(ED_points, dim=0)
+        #     ED_norms = torch.cat(ED_norms, dim=0)
+        #     radii = torch.cat(radii)
+        #     edge_index = torch.cat(edge_index, dim=1)
+        #     isBoundary = torch.cat(isBoundary)
+        #     seman = torch.cat(seman)
+        #     seman_conf = torch.cat(seman_conf, dim=0)
+        # else:
+        # downsample_params=[(0.02, 50, 0.5), (0.05, 20, 1.), (0.1, 20, 1.)]
+        # ball_piv_radii = [0.08, 0.1, 0.15]
+        # downsample_params=[(0.05, 40, 0.5)]
+        # ball_piv_radii = [0.04, 0.08, 0.1]
+        downsample_params = [tuple(self.opt.downsample_params[i * 3: (i + 1) * 3]) for i in range(int(len(self.opt.downsample_params)/3))]
+        if hasattr(data, 'seman'):
+            ED_points, ED_norms, radii, edge_index, triangles, triangles_areas, isBoundary, seman, seman_conf = self.init_ED_nodes(inputs, data, points, norms,
+                candidates_seman=data.seman, candidates_seman_conf=data.seman_conf,
+                downsample_params=downsample_params, ball_piv_radii=self.opt.ball_piv_radii)
+        else:
+            ED_points, ED_norms, radii, edge_index, triangles, triangles_areas, _, _, _ = self.init_ED_nodes(inputs, data, points, norms, 
+                downsample_params=downsample_params, ball_piv_radii=self.opt.ball_piv_radii)
         num = len(ED_points)
-        # TODO: Better way to estimate the radii.
-        radii = edges_lens.mean() * torch.ones((num,), device=dev)
-        neighbor_radii = 2 * edges_lens.mean() * torch.ones((num,), device=dev)
+        edges_lens = torch_distance(ED_points[edge_index[0]], ED_points[edge_index[1]])
 
-        # TODO
-        u = torch.arange(0, self.model_args['CamParams'].WIDTH, step, device=dev)
-        v = torch.arange(0, self.model_args['CamParams'].HEIGHT, step, device=dev)
-        index_map_valid = index_map_valid[v][:,u]
-        index_map = - torch.ones_like(index_map_valid, dtype=long_)
-        index_map[index_map_valid] = torch.arange(num, device=dev)
-        graph = Data(points=ED_points, norms=norms[isED], radii=[radii], neighbor_radii=[neighbor_radii],
+        if self.opt.method == 'seman-super':
+            isBoundary = ~(seman[edge_index[0]] == seman[edge_index[1]])
+            isBoundaryFace = ~((seman[triangles[0]] == seman[triangles[1]]) & (seman[triangles[0]] == seman[triangles[2]]))
+
+            if self.opt.use_edge_ssim_hints:
+                if self.opt.mesh_edge:
+                    boundary_edge_type = torch.ones((torch.count_nonzero(isBoundary), 10), dtype=fl32_).cuda()
+                if self.opt.mesh_face:
+                    boundary_face_type = torch.ones((torch.count_nonzero(isBoundaryFace), 10), dtype=fl32_).cuda()
+
+            isTool = (seman[edge_index[0]] == 2) & (seman[edge_index[1]] == 2)
+
+        # # TODO
+        # edges_weights = edges_lens.reshape(len(ED_points), self.opt.num_ED_neighbors)
+        # edges_weights = torch.flatten(F.softmax(edges_weights, dim=1))
+
+        graph = Data(points=ED_points, norms=ED_norms, radii=radii,
             edge_index=edge_index, edges_lens=edges_lens,
-            face_index=face_index, faces_areas=faces_areas,
-            index_map=index_map, num=num, param_num=num*7)
-        # colors=init_qual_color(ED_points, margin=50.),
+            triangles=triangles, triangles_areas=triangles_areas,
+            num=num, param_num=num*7) 
+            # TODO edges_weights=edges_weights
+            # index_map=index_map, 
+            # neighbor_radii=[neighbor_radii],
+        if hasattr(data, 'seman'):
+            graph.seman = seman
+            graph.seman_conf = seman_conf
+            graph.isBoundary = isBoundary
+            if self.opt.method == 'seman-super':
+                graph.isBoundaryFace = isBoundaryFace
+            
+            graph.inside_edges = seman[edge_index[0]] == seman[edge_index[1]]
+            graph.static_ed_nodes = torch.zeros(num, dtype=bool_).cuda()
 
-        # if data.seg_conf is not None:
-        #     graph.seg_conf = data.seg_conf[isED]
+        if self.opt.method == 'seman-super':
+            if self.opt.use_edge_ssim_hints:
+                if self.opt.mesh_edge:
+                    graph.boundary_edge_type = boundary_edge_type
+                if self.opt.mesh_face:
+                    graph.boundary_face_type = boundary_face_type
+            graph.isTool = isTool
+        #     graph.seman_edge_val=seman_edge_val
 
         return graph
 

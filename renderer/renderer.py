@@ -1,7 +1,6 @@
 import math
 import numpy as np
 import cv2
-import open3d as o3d
 import torch
 from torch import nn
 
@@ -18,42 +17,36 @@ class Pulsar(nn.Module):
     """
     def __init__(self) -> None:
         super(Pulsar, self).__init__()
-
-        # self.cam_params = self.get_cam_params()
         self.gamma = 1.0e-5
 
-    def get_cam_params(self, CamParams, view_scale, opencv=True):
+    def get_cam_params(self, inputs, view_scale, opencv=True):
 
-        R = torch.eye(3, dtype=fl32_, device=dev)
-        openCV2PyTorch3D_R = torch.tensor(
+        R = torch.tensor(
             [[-1.0, 0.0, 0.0],
-            [0.0, -1.0, 0.0],
+            [0.0, 1.0, 0.0],
             [0.0,  0.0, 1.0]], 
-            dtype=fl32_, device=dev)
-        if(opencv==True):
-            R *= openCV2PyTorch3D_R
-        
+            dtype=fl32_).cuda()
         r = matrix_to_rotation_6d(R)
-        T = torch.zeros((3,1), device=dev)
-        R = torch.cat([R, T], dim=1)
-        R = torch.cat([R, torch.tensor([[0.,0.,0.,1]], device=dev)], dim=0)
+        
         focal_length = 0.01
-        h, w = int(CamParams.HEIGHT * view_scale), int(CamParams.WIDTH * view_scale)
-        cx_, cy_ = CamParams.cx * view_scale, CamParams.cy * view_scale
-        fx_ = CamParams.fx * view_scale
+        h, w = int(inputs["height"] * view_scale), int(inputs["width"] * view_scale)
+        cx, cy = inputs["cx"] * view_scale, inputs["cy"] * view_scale
+        fx = inputs["fx"] * view_scale
 
         cam_params = torch.tensor([
-            -R[0,3], -R[1,3], -R[2,3],  # camera position
+            0.0,
+            0.0,
+            0.0,  # Position 0, 0, 0 (x, y, z)
             -r[0], -r[1], -r[2],  
             -r[3], -r[4], -r[5],  # camera rotation
             focal_length,
-            (focal_length*w)/fx_,
-            -math.ceil(cx_ - w / 2),
-            -math.ceil(cy_ - h / 2),
-        ], dtype=fl32_, device=dev)
+            (focal_length * w) / fx,
+            -math.ceil(cx - w / 2),
+            -math.ceil(cy - h / 2),
+        ], dtype=fl32_).cuda()
         return cam_params
 
-    def forward(self, CamParams, data, colors=None, view_scale=1.0, rad=0.02):
+    def forward(self, inputs, data, colors=None, view_scale=1.0, rad=0.01, bg_col=torch.tensor([0.0, 0.0, 0.0]).cuda()):
 
         if colors is None:
             colors = data.colors
@@ -67,19 +60,19 @@ class Pulsar(nn.Module):
         vert_col = colors.type(fl32_)
 
         # Radii of points
-        vert_rad = torch.ones(surfel_num, 
-                    dtype=fl32_, device=dev) * rad
+        vert_rad = torch.ones(surfel_num, dtype=fl32_).cuda() * rad
+        # vert_rad = data.radii.type(fl32_)
         
         # Camera params
-        cam_params = self.get_cam_params(CamParams, view_scale)
+        cam_params = self.get_cam_params(inputs, view_scale)
 
         # The volumetric optimization works better with a higher number of tracked
         # intersections per ray.
         renderer = Renderer(
-            int(CamParams.WIDTH * view_scale),
-            int(CamParams.HEIGHT * view_scale),
+            int(inputs["width"] * view_scale),
+            int(inputs["height"] * view_scale),
             surfel_num, n_track=64, right_handed_system=True
-        ).to(dev)
+        ).cuda()
 
         return renderer.forward(
             vert_pos,
@@ -89,7 +82,7 @@ class Pulsar(nn.Module):
             self.gamma,
             15.0,
             return_forward_info=False,
-            bg_col=torch.tensor([0.0, 0.0, 0.0], device=dev),
+            bg_col=bg_col,
         )
 
 
@@ -100,11 +93,11 @@ class Projector(nn.Module):
 
         self.method = method
 
-    def forward(self, allModel, qual_color=False):
+    def forward(self, inputs, allModel, qual_color=False):
 
         if self.method == "direct":
-            y, x, _, valid_indices = pcd2depth(allModel.points, depth_sort=True)
-            out = torch.zeros((HEIGHT,WIDTH,3), device=dev)
+            y, x, _, valid_indices = pcd2depth(inputs, allModel.points, depth_sort=True)
+            out = torch.zeros((inputs["height"], inputs["width"], 3)).cuda()
             if qual_color:
                 out[y,x] = allModel.eval_colors[valid_indices].float()
             else:
@@ -114,9 +107,7 @@ class Projector(nn.Module):
             rod, _ = cv2.Rodrigues(np.eye(3)) # [R]otation matrix.
             # Flip the points upside down
             points = torch_to_numpy(allModel.points)
-            points[:,1] = -points[:,1]
-            points[:,2] = -points[:,2]
-            img_quads, _ = cv2.projectPoints(points, rod, np.zeros((3,1)), K, np.array([]))
+            img_quads, _ = cv2.projectPoints(points, rod, np.zeros((3,1)), inputs[("K", 0)][0, :3, :3], np.array([]))
             out = np.zeros((HEIGHT,WIDTH,3))
             y = np.round(img_quads[:,0,1]).astype(int)
             x = np.round(img_quads[:,0,0]).astype(int)
@@ -128,96 +119,3 @@ class Projector(nn.Module):
             out = numpy_to_torch(out)
 
         return out
-
-### Mesh renderer.
-# Ref: Pulsar: Efficient Sphere-based Neural Rendering
-class pyt3dMeshRasterizer(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-
-        self.cam_params = self.get_cam_params()
-        self.gamma = 1.0e-5
-
-    def get_cam_params(self, opencv=True):
-
-        R = torch.eye(3, dtype=fl32_, device=dev)
-        openCV2PyTorch3D_R = torch.tensor(
-            [[-1.0, 0.0, 0.0],
-            [0.0, -1.0, 0.0],
-            [0.0,  0.0, 1.0]], 
-            dtype=fl32_, device=dev)
-        if(opencv==True):
-            R *= openCV2PyTorch3D_R
-        
-        r = matrix_to_rotation_6d(R)
-        T = torch.zeros((3,1), device=dev)
-        R = torch.cat([R, T], dim=1)
-        R = torch.cat([R, torch.tensor([[0.,0.,0.,1]], device=dev)], dim=0)
-        focal_length = 0.01
-
-        cam_params = torch.tensor([
-            -R[0,3], -R[1,3], -R[2,3],  # camera position
-            -r[0], -r[1], -r[2],  
-            -r[3], -r[4], -r[5],  # camera rotation
-            focal_length,
-            (focal_length*WIDTH)/fx,
-            -math.ceil(cx - WIDTH / 2),
-            -math.ceil(cy - HEIGHT / 2),
-        ], dtype=fl32_, device=dev)
-        return cam_params
-
-    def forward(self, mesh):
-
-        if qual_color:
-            valid = ~torch.isnan(allModel.eval_colors[:,0])
-            points = allModel.points[valid]
-            colors = allModel.eval_colors[valid]
-        else:
-            points = allModel.points
-            colors = allModel.colors
-        surfel_num = len(points)
-
-        # Points
-        self.register_parameter(
-            "vert_pos", 
-            nn.Parameter(
-                points.type(fl32_), requires_grad=True
-            ),
-        )
-        
-        # Colors
-        self.register_parameter(
-            "vert_col",
-            nn.Parameter(
-                colors.type(fl32_), requires_grad=True
-            ),
-        )
-
-        # Radii of points
-        self.register_parameter(
-            "vert_rad",
-            nn.Parameter(
-                torch.ones(surfel_num, 
-                    dtype=fl32_, device=dev) * rad,
-                requires_grad=True
-            ),
-        )
-        
-        # # Camera params
-        # self.register_buffer("cam_params", self.cam_params)
-
-        # The volumetric optimization works better with a higher number of tracked
-        # intersections per ray.
-        renderer = Renderer(
-            WIDTH, HEIGHT, surfel_num, n_track=64, right_handed_system=True
-        )#.to(dev)
-
-        return renderer.forward(
-            self.vert_pos,
-            self.vert_col,
-            self.vert_rad,
-            self.cam_params,
-            self.gamma,
-            15.0,
-            return_forward_info=True,
-        )#[0]
