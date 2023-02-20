@@ -4,39 +4,33 @@ import numpy as np
 import torch
 import copy
 
-# from utils import img_matching
-
-from utils.config import *
 from utils.utils import *
 from super.loss import *
 
 class LM_Solver():
-    def __init__(self, method, \
-        data_cost, corr_cost, depth_cost, arap_cost, rot_cost, \
-        data_lambda, corr_lambda, depth_lambda, arap_lambda, rot_lambda, \
-        phase="test"):
+    def __init__(self, opt):
+
+        self.device = torch.device("cpu" if not torch.cuda.is_available() else "cuda")
         
         self.losses = []
         self.lambdas = []
-        if data_cost:
+        if opt.sf_point_plane:
             self.losses.append(DataLoss())
-            self.lambdas.append(data_lambda)
-        if depth_cost:
-            self.losses.append(FeatLoss(use_point=True))
-            self.lambdas.append(depth_lambda)
-        if arap_cost:
+            self.lambdas.append(opt.sf_point_plane_weight)
+        # if depth_cost:
+        #     self.losses.append(FeatLoss(use_point=True))
+        #     self.lambdas.append(depth_lambda)
+        if opt.mesh_arap:
             self.losses.append(ARAPLoss())
-            self.lambdas.append(arap_lambda)
-        if rot_cost:
+            self.lambdas.append(opt.mesh_arap_weight)
+        if opt.mesh_rot:
             self.losses.append(RotLoss())
-            self.lambdas.append(rot_lambda)
-        if corr_cost:
-            self.losses.append(CorrLoss(point_loss=True))
-            self.lambdas.append(corr_lambda)
+            self.lambdas.append(opt.mesh_rot_weight)
+        # if corr_cost:
+        #     self.losses.append(CorrLoss(point_loss=True))
+        #     self.lambdas.append(corr_lambda)
 
-        self.phase = phase
-        self.beta_init = torch.tensor([[1.,0.,0.,0.,0.,0.,0.]], dtype=fl64_, device=dev)
-        # self.beta_init = torch.tensor([[1.,0.,0.,0.,0.,0.,0.]], dtype=fl32_, device=dev)
+        self.phase = opt.phase
 
     # Solvers.
     @staticmethod
@@ -56,15 +50,15 @@ class LM_Solver():
         return x
 
     # Calculate the Jacobians/losses.
-    def prepareCostTerm(self, sfModel, new_data, beta, grad=False):
+    def prepareCostTerm(self, sf, inputs, new_data, beta, grad=False):
 
         if grad:
-            jtj = torch.zeros((sfModel.ED_nodes.param_num, sfModel.ED_nodes.param_num), \
-                layout=torch.sparse_coo, dtype=fl32_, device=dev)
-            jtl = torch.zeros((sfModel.ED_nodes.param_num, 1), dtype=fl32_, device=dev)
+            jtj = torch.zeros((sf.ED_nodes.param_num, sf.ED_nodes.param_num), \
+                layout=torch.sparse_coo, dtype=torch.float64, device=self.device)
+            jtl = torch.zeros((sf.ED_nodes.param_num, 1), dtype=torch.float64, device=self.device)
         
             for loss_term, lambda_ in zip(self.losses, self.lambdas):
-                jtj_, jtl_ = loss_term.forward(lambda_, beta, new_data, grad=True)
+                jtj_, jtl_ = loss_term.forward(lambda_, beta, inputs, new_data, grad=True)
                 if jtj_ is not None:
                     jtj += jtj_
                     jtl += jtl_
@@ -76,27 +70,27 @@ class LM_Solver():
             loss = []
 
             for loss_term, lambda_ in zip(self.losses, self.lambdas):
-                loss_ = loss_term.forward(lambda_, beta, new_data)
+                loss_ = loss_term.forward(lambda_, beta, inputs, new_data)
                 if loss_ is not None: loss.append(loss_)
             del loss_
 
             return torch.sum(torch.cat(loss))
 
     # LM algorithm
-    def LM(self, sfModel, new_data, u = 50., v = 7.5, minimal_loss = 1e10, num_Iter=10):
+    def LM(self, sf, inputs, new_data, u = 10, v = 7.5, minimal_loss = 1e10, num_Iter=10):
 
         # Init quaternion and translation parameters.
-        best_beta = self.beta_init.repeat(sfModel.ED_nodes.num,1)
+        best_beta = torch.tensor([[1.,0.,0.,0.,0.,0.,0.]], 
+                                dtype=torch.float64, 
+                                device=self.device
+                                ).repeat(sf.ED_nodes.num,1)
         beta = copy.deepcopy(best_beta)
 
-        jtj_diag_i = torch.arange(sfModel.ED_nodes.param_num, device=dev)
-        for loss_term in self.losses: loss_term.prepare(sfModel, new_data)
-        for i in range(num_Iter):
-
-            if debug_mode: # TODO
-                start_ = timeit.default_timer()
-            
-            jtj, jtl = self.prepareCostTerm(sfModel, new_data, beta, grad=True) #points, norms, valid, 
+        jtj_diag_i = torch.arange(sf.ED_nodes.param_num, device=self.device)
+        for loss_term in self.losses: 
+            loss_term.prepare(sf, new_data)
+        for i in range(num_Iter):     
+            jtj, jtl = self.prepareCostTerm(sf, inputs, new_data, beta, grad=True) #points, norms, valid, 
             jtj[jtj_diag_i,jtj_diag_i] += u
 
             try:
@@ -107,7 +101,7 @@ class LM_Solver():
             
             beta += delta
 
-            loss = self.prepareCostTerm(sfModel, new_data, beta)
+            loss = self.prepareCostTerm(sf, inputs, new_data, beta)
             
             if self.phase == "train": # TODO
                 minimal_loss = loss
@@ -123,8 +117,6 @@ class LM_Solver():
                     u *= v
                     beta = copy.deepcopy(best_beta)
 
-                if debug_mode: # TODO
-                    stop_ = timeit.default_timer()
-                    print("***Debug*** Iter: {}; time: {}s; loss: {}".format(i,np.round(stop_-start_,3),loss) )
+        sf.logger.info(f"{inputs['ID'].item()} loss: {loss}")
 
-        return beta#.type(fl32_)
+        return beta

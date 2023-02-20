@@ -1,6 +1,8 @@
+import numpy as np
 import datetime
 import cv2
 import copy
+from skimage.metrics import structural_similarity
 import open3d as o3d
 
 import pandas as pd
@@ -12,7 +14,6 @@ from torch_geometric.data import Data
 
 from super.utils import *
 
-from utils.config import *
 from utils.utils import *
 from utils.labels import id2color
 from utils.data_loader import SSIM
@@ -25,10 +26,13 @@ class Surfels():
         self.opt = opt
         self.models = models
         self.evaluate_tracking = self.opt.tracking_gt_file is not None
-        self.mssim = []
+        # self.mssim = []
+
+        if opt.hard_seg:
+            assert opt.method == "semantic-super"
         
-        if self.opt.method == "seman-super":
-            self.power_arg = (1/2, 1/2) # (2/3, 1/3)
+        if self.opt.method == "semantic-super":
+            self.power_arg = (1/2, 1/2)
         
         if self.opt.phase == 'test':
             self.output_dir = os.path.join(self.opt.sample_dir, f"model{self.opt.mod_id}_exp{self.opt.exp_id}")
@@ -52,119 +56,78 @@ class Surfels():
             self.track_pts = np.array(np.load(tracking_gt_file, allow_pickle=True)).tolist()
             for key in self.track_pts.keys():
                 for filename in self.track_pts[key]:
-                    self.track_pts[key][filename] = numpy_to_torch(self.track_pts[key][filename], dtype=int_)
+                    self.track_pts[key][filename] = numpy_to_torch(self.track_pts[key][filename], dtype=torch.int)
             
             track_gt = self.track_pts["gt"]
             self.track_num = len(list(track_gt.items())[0][1])
-            self.track_id = - torch.ones((self.track_num,), dtype=long_).cuda()
+            self.track_id = - torch.ones((self.track_num,), dtype=torch.long).cuda()
             # -1: Haven't started tracking; 
             # >=0: ID of tracked points; 
             # -2: Lost tracking.
             self.track_rsts = {}
-
-        if self.opt.load_seman_gt:
-            self.result_dice = []
-            self.result_jaccard = []
 
         for key, v in data.items():
             if key == 'valid':
                 continue
             setattr(self, key, v)
         self.sf_num = len(self.points)
-        self.isStable = torch.ones((self.sf_num,), dtype=bool_).cuda()
+        self.isStable = torch.ones((self.sf_num,), dtype=torch.bool).cuda()
         self.time_stamp = self.time * torch.ones(self.sf_num).cuda()
 
-        # self.validmap = self.valid.view(HEIGHT,WIDTH)
-        # valid_indexs = torch.arange(self.sf_num, dtype=int, device=dev).unsqueeze(1)
-        # valid_coords = torch.flip(self.validmap.nonzero(), dims=[-1])
-        # # Column direction of self.projdata:
-        # # 1) index of projected points in self.points, 
-        # # corresponding projection coordinates (x,y) on the image plane 
-        # self.projdata = torch.cat([valid_indexs,valid_coords], dim=1).type(tfdtype_)
-
         self.projdata = torch.flip(
-            data.valid.view(inputs["height"], inputs["width"]).nonzero(), 
-            dims=[-1]).type(fl32_)
+            data.valid.view(self.opt.height, self.opt.width).nonzero(), 
+            dims=[-1]).type(torch.float32)
 
         # init ED nodes
         self.update_ED()
         self.logger.info(f" Number of parameters: {self.ED_nodes.param_num}")
         self.logger.info(f" Average ED graph edge length: {self.ED_nodes.edges_lens.mean()/0.1*5} mm")
 
-        # if hasattr(new_data,'x'):
-        #     if model_args['method'] == 'super':
-        #         pass
-        #     elif model_args['method'] == 'dlsuper':
-        #         v, u, _, _ = pcd2depth(self.points, round_coords=False, valid_margin=1)
-        #         # sh, sw = new_data.x.size()[2:]
-        #         # sh /= HEIGHT
-        #         # sw /= WIDTH
-        #         # x, _, _ = bilinear_sample([new_data.x[0].permute(1,2,0)], v*sh, u*sw)
-        #         x, _, _ = bilinear_sample([new_data.x[0].permute(1,2,0)], v/8., u/8.)
-        #         self.x = x[0]
-
-        # if model_args['do_segmentation']:
-        #     self.points = self.points.unsqueeze(0).repeat(self.class_num, 1, 1)
-        #     self.norms = self.norms.unsqueeze(0).repeat(self.class_num, 1, 1)
-
-        # Init renderer.
-        # if render_method == 'proj': self.renderer = Projector().to(dev)
-        # elif render_method == 'pulsar': self.renderer = Pulsar().to(dev)
-
         # Keyframes
-        # if self.opt.sf_corr_use_keyframes:
         init_y, init_x, _, _ = pcd2depth(inputs, self.points, round_coords=False, valid_margin=1)
-        self.keyframes = (inputs[("color", 0, 0)], 
+        self.keyframes = (inputs[("color", 0)], 
                             torch.arange(len(init_x))[None, ...].cuda(),
-                            torch.stack([init_x, init_y], dim=1)[None, ...].type(fl64_).cuda()
+                            torch.stack([init_x, init_y], dim=1)[None, ...].type(torch.float64).cuda()
                             )
 
-    # Init/update ED nodes & ED nodes related parameters. TODO
+    # Init / update ED nodes & ED nodes related parameters.
     def update_ED(self, new_nodes=None):
         if new_nodes is None: # Init.
             # Find 8 neighbors of ED nodes.
-            if self.opt.hard_seman and False:
+            if self.opt.hard_seg:
                 dists, sort_idx = find_knn(self.ED_nodes.points, self.ED_nodes.points, 
                 k=self.opt.num_ED_neighbors+1, num_classes=self.opt.num_classes, 
-                seman1=self.ED_nodes.seman, seman2=self.ED_nodes.seman)
+                seg1=self.ED_nodes.seg, seg2=self.ED_nodes.seg)
             else:
                 dists, sort_idx = find_knn(self.ED_nodes.points, self.ED_nodes.points, 
                     k=self.opt.num_ED_neighbors+1)
             dists = dists[:, 1:] / self.ED_nodes.radii[:, None]
             sort_idx = sort_idx[:, 1:]
-            # dists, sort_idx = find_knn(self.ED_nodes.points, self.ED_nodes.points, 
-            #     k=self.opt.num_ED_neighbors+2)
-            # dists = dists[:, 1:-1] / dists[:, -1:]
-            # sort_idx = sort_idx[:, 1:-1]
-            if self.opt.method == "seman-super" and False:
-                P = self.ED_nodes.seman_conf[:, None, :]
-                Q = self.ED_nodes.seman_conf[sort_idx]
-                self.ED_nodes.knn_w = F.softmax(
-                                torch.pow(torch.exp(-JSD(P, Q)), self.power_arg[0]) * \
-                                torch.pow(torch.exp(-dists), self.power_arg[1])
-                                , dim=-1) # Jensen-Shannon divergence
-            else:
-                self.ED_nodes.knn_w = F.softmax(torch.exp(-dists), dim=-1)
+            
+            # if self.opt.method == "semantic-super":
+            #     P = self.ED_nodes.seg_conf[:, None, :]
+            #     Q = self.ED_nodes.seg_conf[sort_idx]
+            #     self.ED_nodes.knn_w = F.softmax(
+            #                     torch.pow(torch.exp(-JSD(P, Q)), self.power_arg[0]) * \
+            #                     torch.pow(torch.exp(-dists), self.power_arg[1])
+            #                     , dim=-1) # Jensen-Shannon divergence
+            # else:
+            self.ED_nodes.knn_w = F.softmax(torch.exp(-dists), dim=-1)
             self.ED_nodes.knn_indices = sort_idx
             
             # Find 4 neighboring ED nodes of surfels.
-            # if self.opt.method == "seman-super" and False:
-            if self.opt.hard_seman:
+            if self.opt.hard_seg:
                 dists, self.knn_indices = find_knn(self.points, self.ED_nodes.points,
                     k=self.opt.num_neighbors, num_classes=self.opt.num_classes,
-                    seman1=self.seman, seman2=self.ED_nodes.seman)
+                    seg1=self.seg, seg2=self.ED_nodes.seg)
             else:
                 dists, self.knn_indices = find_knn(self.points, self.ED_nodes.points,
                     k=self.opt.num_neighbors)
             radii = self.ED_nodes.radii[self.knn_indices]
             self.isStable[~torch.any(dists <= radii, dim=1)] = False # If surfels are too far away from its knn ED nodes, this surfels will be disabled.
-            if self.opt.method == "seman-super" and not self.opt.hard_seman:
-                P = self.ED_nodes.seman_conf[self.knn_indices]
-                Q = self.seman_conf[:, None, :]
-                # self.knn_w = F.softmax(
-                #                 torch.sqrt(
-                #                     torch.exp(- KLD(P, Q)) * torch.exp(-KLD(Q, P)) * torch.exp(- dists / radii)
-                #                 ), dim=-1)
+            if self.opt.method == "semantic-super" and not self.opt.hard_seg:
+                P = self.ED_nodes.seg_conf[self.knn_indices]
+                Q = self.seg_conf[:, None, :]
                 self.knn_w = F.softmax(
                                 torch.pow(torch.exp(- JSD(P, Q)), self.power_arg[0]) * \
                                 torch.pow(torch.exp(- dists / radii), self.power_arg[1])
@@ -183,21 +146,27 @@ class Surfels():
         sf_diff = self.points.unsqueeze(1) - sf_knn
         deform_ = deform[self.knn_indices]
         self.points, _ = Trans_points(sf_diff, sf_knn, deform_, self.knn_w)
-        self.points += deform[-1:, 4:] # T_g
+        if not self.opt.use_derived_gradient:
+            self.points += deform[-1:, 4:] # T_g
         
         norms, _ = transformQuatT(
             self.norms.unsqueeze(1).repeat(1,self.opt.num_neighbors,1),
             deform_)
         norms = torch.sum(self.knn_w.unsqueeze(-1) * norms, dim=-2)
-        norms, _ = transformQuatT(norms, deform[-1:,0:4]) # T_g
+        if not self.opt.use_derived_gradient:
+            norms, _ = transformQuatT(norms, deform[-1:,0:4]) # T_g
         self.norms = F.normalize(norms, dim=-1)
 
         # self.time_stamp = time * torch.ones_like(self.time_stamp)
         
-        self.ED_nodes.points += deform[:-1,4:]
-        self.ED_nodes.points += deform[-1:, 4:] # T_g
-        ED_norms, _ = transformQuatT(self.ED_nodes.norms, deform[:-1,0:4])
-        ED_norms, _ = transformQuatT(ED_norms, deform[-1:,0:4]) # T_g
+        if self.opt.use_derived_gradient:
+            self.ED_nodes.points += deform[:,4:]
+            ED_norms, _ = transformQuatT(self.ED_nodes.norms, deform[:,0:4])
+        else:
+            self.ED_nodes.points += deform[:-1,4:]
+            self.ED_nodes.points += deform[-1:, 4:] # T_g
+            ED_norms, _ = transformQuatT(self.ED_nodes.norms, deform[:-1,0:4])
+            ED_norms, _ = transformQuatT(ED_norms, deform[-1:,0:4]) # T_g
         self.ED_nodes.norms = F.normalize(ED_norms, dim=-1)
     
         if boundary_edge_type is not None:
@@ -205,7 +174,7 @@ class Surfels():
         if boundary_face_type is not None:
             self.ED_nodes.boundary_face_type = boundary_face_type
 
-        # if self.opt.method == 'seman-super':
+        # if self.opt.method == 'semantic-super':
         #     new_edges_lens = torch_distance(self.ED_nodes.points[self.ED_nodes.edge_index[0]], self.ED_nodes.points[self.ED_nodes.edge_index[1]])
             
         #     seman_edge_val = torch.ones_like(self.ED_nodes.isBoundary)
@@ -226,14 +195,14 @@ class Surfels():
             p_new, n_new, c_new, r_new, w_new = get_data(indices2, data2)
 
             if len(p) == 0:
-                return torch.zeros(len(p), dtype=bool_).cuda()
+                return torch.zeros(len(p), dtype=torch.bool).cuda()
 
             # Only merge points that are close enough.
             # print(torch_inner_prod(n, n_new))
             valid = (torch_distance(p, p_new) < self.opt.th_dist) & \
                 (torch_inner_prod(n, n_new) > self.opt.th_cosine_ang)
-            if self.opt.hard_seman or self.opt.data == "superv1":
-                valid &= data1.seman[indices1] == data2.seman[indices2]
+            if self.opt.hard_seg or self.opt.data == "superv1":
+                valid &= data1.seg[indices1] == data2.seg[indices2]
             indices = indices1[valid]
             w, w_new = w[valid], w_new[valid]
             w_update = w + w_new
@@ -255,14 +224,14 @@ class Surfels():
                 self.colors[indices] = w_color / w_color_sum * c[valid] + w_color_new / w_color_sum * c_new[valid]
             else:
                 self.colors[indices] = w * c[valid] + w_new * c_new[valid]
-            self.time_stamp[indices] = time.type(fl32_) # Update time stamps.
+            self.time_stamp[indices] = time # Update time stamps.
 
             # Merge semantic information.
-            if hasattr(self, 'seman'):
-                self.seman_conf[indices] = w * data1.seman_conf[indices1][valid] + \
-                    w_new * data2.seman_conf[indices2][valid]
-                self.seman_conf[indices] = self.seman_conf[indices] / self.seman_conf[indices].sum(1, keepdim=True)
-                self.seman[indices] = torch.argmax(self.seman_conf[indices], dim=1).type(long_)
+            if hasattr(self, 'seg'):
+                self.seg_conf[indices] = w * data1.seg_conf[indices1][valid] + \
+                    w_new * data2.seg_conf[indices2][valid]
+                self.seg_conf[indices] = self.seg_conf[indices] / self.seg_conf[indices].sum(1, keepdim=True)
+                self.seg[indices] = torch.argmax(self.seg_conf[indices], dim=1).type(torch.long)
 
             return valid
 
@@ -300,11 +269,11 @@ class Surfels():
                 _counts_ = counts[counts < counts_limits]
                 temp_coords = coords[_counts_]
 
-            val_map = torch.zeros((inputs["height"] * inputs["width"]), dtype=bool_).cuda()
+            val_map = torch.zeros((self.opt.height * self.opt.width), dtype=torch.bool).cuda()
             val_map[temp_coords] = True
             val_maps.append(val_map)
 
-            index_map = torch.zeros((inputs["height"] * inputs["width"]), dtype=long_).cuda()
+            index_map = torch.zeros((self.opt.height * self.opt.width), dtype=torch.long).cuda()
             index_map[temp_coords] = ids[_counts_]
             index_maps.append(index_map)
 
@@ -356,7 +325,7 @@ class Surfels():
                     indices1 = indices1[val_merge]
                     for k, tid in enumerate(self.track_id):
                         if tid in indices2:
-                            self.track_id[k] = indices1[indices2==tid].type(long_)
+                            self.track_id[k] = indices1[indices2==tid].type(torch.long)
         
         ## Delete redundant surfels.
         if len(del_indices) > 0:
@@ -372,7 +341,7 @@ class Surfels():
             self.isStable[del_indices] = False
 
         ## Update the knn weights of existing surfels.
-        if self.opt.method == "seman-super":
+        if self.opt.method == "semantic-super":
             # keep_ids = self.seman == self.ED_nodes.seman[self.knn_indices[:,0]]
             # shuffle_ids = ~keep_ids
 
@@ -391,8 +360,8 @@ class Surfels():
                 self.ED_nodes.points[self.knn_indices])
             radii = self.ED_nodes.radii[self.knn_indices]
 
-            P = self.ED_nodes.seman_conf[self.knn_indices]
-            Q = self.seman_conf[:, None, :]
+            P = self.ED_nodes.seg_conf[self.knn_indices]
+            Q = self.seg_conf[:, None, :]
             # self.knn_w = F.softmax(
             #                 torch.sqrt(
             #                     torch.exp(- KLD(P, Q)) * torch.exp(- KLD(Q, P)) * torch.exp(- dists / radii)
@@ -416,20 +385,20 @@ class Surfels():
                 # Extract new surfels and check if each of them has corresponding ED nodes.
                 new_points = sfdata.points[add_valid]
                 # Update the knn weights and indicies of new surfels.
-                new_isStable = torch.ones(len(new_points), dtype=bool_).cuda()
-                # if self.opt.method == "seman-super" and False:
-                if self.opt.hard_seman:
+                new_isStable = torch.ones(len(new_points), dtype=torch.bool).cuda()
+                # if self.opt.method == "semantic-super" and False:
+                if self.opt.hard_seg:
                     dists, new_knn_indices = find_knn(new_points, self.ED_nodes.points, 
                         k=self.opt.num_neighbors, num_classes=self.opt.num_classes, 
-                        seman1=sfdata.seman[add_valid], seman2=self.ED_nodes.seman)
+                        seg1=sfdata.seg[add_valid], seg2=self.ED_nodes.seg)
                 else:
                     dists, new_knn_indices = find_knn(new_points, self.ED_nodes.points, 
                         k=self.opt.num_neighbors)
                 radii = self.ED_nodes.radii[new_knn_indices]
                 new_isStable[~torch.any(dists <= radii, dim=1)] = False # If surfels are too far away from its knn ED nodes, this surfels will be disabled.
-                if self.opt.method == "seman-super" and not self.opt.hard_seman:
-                    P = self.ED_nodes.seman_conf[new_knn_indices]
-                    Q = sfdata.seman_conf[add_valid][:, None, :]
+                if self.opt.method == "semantic-super" and not self.opt.hard_seg:
+                    P = self.ED_nodes.seg_conf[new_knn_indices]
+                    Q = sfdata.seg_conf[add_valid][:, None, :]
                     # new_knn_w = F.softmax(
                     #                 torch.sqrt(
                     #                     torch.exp(- KLD(P, Q)) * torch.exp(- KLD(Q, P)) * torch.exp(- dists / radii)
@@ -441,7 +410,7 @@ class Surfels():
                 else:
                     new_knn_w = F.softmax(torch.exp(- dists / radii), dim=-1)
 
-                self.isStable = torch.cat([self.isStable, torch.ones(torch.count_nonzero(new_isStable), dtype=bool_).cuda()])
+                self.isStable = torch.cat([self.isStable, torch.ones(torch.count_nonzero(new_isStable), dtype=torch.bool).cuda()])
                 self.knn_w = torch.cat([self.knn_w, new_knn_w[new_isStable]], dim=0)
                 self.knn_indices = torch.cat([self.knn_indices, new_knn_indices[new_isStable]], dim=0)
 
@@ -451,7 +420,7 @@ class Surfels():
                 for key, v in sfdata.items():
                     if key in ['norms', 'colors']: # 'points', 
                         v = torch.cat([getattr(self, key), v[add_valid][new_isStable]], dim=0)
-                    elif key in ['seman', 'seman_conf', 'radii', 'confs', 'dist2edge']:
+                    elif key in ['seg', 'seg_conf', 'radii', 'confs', 'dist2edge']:
                         v = torch.cat([getattr(self, key), v[add_valid][new_isStable]])
                     elif key == 'time':
                         v = torch.cat([self.time_stamp, v*torch.ones(new_sf_num).cuda()])
@@ -470,7 +439,7 @@ class Surfels():
                 
 
         v, u, _, _ = pcd2depth(inputs, self.points, round_coords=False)
-        self.projdata = torch.stack([u, v], dim=1).type(fl32_)
+        self.projdata = torch.stack([u, v], dim=1).type(torch.float32)
 
     # If evaluate on the SuPer dataset, init self.label_index which includes
     # the indicies of the tracked points.
@@ -488,7 +457,7 @@ class Surfels():
                 # inval_id = self.track_id[(self.track_id >= 0) | torch.isnan(self.track_id)]
                 inval_id = self.track_id[(self.track_id >= 0) | (self.track_id == -2)]
                 if len(inval_id) > 0:
-                    dists[inval_id.type(long_)] = 1e13
+                    dists[inval_id.type(torch.long)] = 1e13
                     dists[~self.isStable] = 1e13
                 if torch.min(dists) < th:
                     self.track_id[k] = torch.argmin(dists)
@@ -527,18 +496,15 @@ class Surfels():
         
         for k, tid in enumerate(self.track_id):
             if tid >= 0:
-                self.track_rsts[filename][k, 0:2] = self.projdata[tid.type(long_)] # self.projdata[tid.type(long_), 1:]
+                self.track_rsts[filename][k, 0:2] = self.projdata[tid.type(torch.long)] # self.projdata[tid.type(long_), 1:]
                 self.track_rsts[filename][k, 2] = 1
         # print("update", self.track_id)
 
     # Delete unstable surfels & ED nodes.
     def prepareStableIndexNSwapAllModel(self, inputs, sfdata):
         # A surfel is unstable if it 1) hasn't been updated for a long time,
-        # and 2) has low confidence.
-        # self.isStable = self.isStable & \
-        #     ((inputs["time"]-self.time_stamp < self.opt.th_time_steps) |\
-        #     (self.confs >= self.opt.th_conf))
-        self.isStable = self.isStable & (inputs["time"]-self.time_stamp < self.opt.th_time_steps)
+        # and 2) has low confidence (TODO: better confidence).
+        self.isStable = self.isStable & (inputs["time"]-self.time_stamp < self.opt.th_time_steps) # self.confs >= self.opt.th_conf
         self.isStable[self.track_id[self.track_id>=0]] = True
         
         self.points = self.points[self.isStable]
@@ -550,12 +516,12 @@ class Surfels():
         self.knn_indices = self.knn_indices[self.isStable]
         self.knn_w = self.knn_w[self.isStable]
         self.projdata = self.projdata[self.isStable]
-        if hasattr(self, "seman"):
-            self.seman = self.seman[self.isStable]
-            self.seman_conf = self.seman_conf[self.isStable]
+        if hasattr(self, "seg"):
+            self.seg = self.seg[self.isStable]
+            self.seg_conf = self.seg_conf[self.isStable]
             self.dist2edge = self.dist2edge[self.isStable]
         if self.evaluate_tracking:
-            id_map = - torch.ones(len(self.isStable), dtype=long_).cuda()
+            id_map = - torch.ones(len(self.isStable), dtype=torch.long).cuda()
             id_map[self.isStable] = torch.arange(torch.count_nonzero(self.isStable)).cuda()
             track_id_val = self.track_id >= 0
             self.track_id[track_id_val] = id_map[self.track_id[track_id_val]]
@@ -563,7 +529,7 @@ class Surfels():
 
         if self.evaluate_tracking:
             inval_id = (self.track_id >= 0) & torch.tensor(
-                [False if tid == torch.tensor(-2) else ~self.isStable[tid.type(long_)] for tid in self.track_id]).cuda()
+                [False if tid == torch.tensor(-2) else ~self.isStable[tid.type(torch.long)] for tid in self.track_id]).cuda()
             if inval_id.count_nonzero() > 0:
                 self.track_id[inval_id] = torch.tensor(-2)
         
@@ -578,27 +544,37 @@ class Surfels():
             if (self.track_id == -1).count_nonzero() > 0:
                 self.init_track_pts(sfdata, inputs["filename"][0])
 
-        # v, u, coords, valid_indexs = pcd2depth(self.points, depth_sort=True, round_coords=False)
-        # self.valid = torch.zeros(PIXEL_NUM, dtype=bool_, device=dev)
-        # self.valid[coords] = True
-        # self.validmap = self.valid.view(HEIGHT,WIDTH)
-        # self.projdata = torch.stack([valid_indexs,v,u],dim=1)
+        # if (self.opt.feature_loss and self.opt.feature_loss_option == "depth") or \
+        # (self.opt.optical_flow_model == "raft_github" and self.opt.raft_option == "depth"):
+        #     self.prev_disp_feature = inputs["disp_feature"]
         
         # Render the current 3D model to an image.
         self.render_img(inputs)
 
-        ssim_map = 1 - SSIM()(self.renderImg, inputs[("color", 0, 0)]) * 2
-        self.mssim.append(ssim_map.mean().item())
+        # img = torch_to_numpy(inputs[("color", 0)][0])
+        # img_pred = torch_to_numpy(self.renderImg[0])
+        # mssim = structural_similarity(img, img_pred, 
+        #                             data_range=img.max() - img.min(),
+        #                             channel_axis=0,
+        #                             gaussian_weights=True, sigma=11)
+        # self.mssim.append(mssim)
 
         self.viz(inputs, sfdata)
 
-        if self.opt.save_ply or self.opt.save_seman_ply:
+        # if self.opt.feature_loss:
+        #     grid_x = self.projdata[:,0] / self.opt.width * 2. - 1.
+        #     grid_y = self.projdata[:,1] / self.opt.height * 2. - 1.
+        #     self.features = F.grid_sample(inputs[("disp_feature", 0)], 
+        #                                   torch.stack([grid_x, grid_y], dim=1)[None, :, None, :]
+        #                                  )[0, :, :, 0].permute(1, 0)
+
+        if self.opt.save_ply or self.opt.save_seg_ply:
             ### Smooth point cloud ###
-            disp_points = self.points[self.isStable][self.seman[self.isStable] < 2]
+            disp_points = self.points[self.isStable][self.seg[self.isStable] < 2]
             if self.opt.save_ply:
-                disp_colors = self.colors[self.isStable][self.seman[self.isStable] < 2]
-            elif self.opt.save_seman_ply:
-                disp_colors = torch.flip(numpy_to_torch(id2color), [1])[self.seman[self.isStable]][self.seman[self.isStable] < 2]
+                disp_colors = self.colors[self.isStable][self.seg[self.isStable] < 2]
+            elif self.opt.save_seg_ply:
+                disp_colors = torch.flip(numpy_to_torch(id2color), [1])[self.seg[self.isStable]][self.seg[self.isStable] < 2]
 
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(disp_points.cpu().numpy())
@@ -613,7 +589,7 @@ class Surfels():
             disp_points = disp_points / 0.1 * 0.005 # baseline: 5mm, unit: m
             if self.opt.save_ply:
                 disp_colors = (255 * np.asarray(pcd.colors)).astype(np.uint8)
-            elif self.opt.save_seman_ply:
+            elif self.opt.save_seg_ply:
                 disp_colors = np.asarray(pcd.colors).astype(np.uint8)
             ######
 
@@ -622,26 +598,20 @@ class Surfels():
             cloud = PyntCloud(pd.DataFrame(data=pcd_to_save))
             if self.opt.save_ply:
                 ply_output_dir = os.path.join(self.output_dir, f"{os.path.basename(self.opt.sample_dir)}_ply")
-            elif self.opt.save_seman_ply:
+            elif self.opt.save_seg_ply:
                 ply_output_dir = os.path.join(self.output_dir, f"{os.path.basename(self.opt.sample_dir)}_seman_ply")
             if not os.path.exists(ply_output_dir):
                 os.makedirs(ply_output_dir)
             cloud.to_file(os.path.join(ply_output_dir, f"{inputs['filename'][0]}.ply"))
 
     def render_img(self, inputs):
-        # if "del_points" in inputs:
-        #     data = Data(points=torch.cat([self.points[self.isStable], inputs["del_points"][0]], dim=0), 
-        #                 colors=torch.cat([self.colors[self.isStable], inputs["del_colors"][0]], dim=0))
-        # else:
         data = Data(points=self.points[self.isStable], 
                     colors=self.colors[self.isStable]) # radii=self.radii[self.isStable]
         
         with torch.no_grad():
-            self.renderImg = self.models["renderer"](inputs, data, 
+            self.renderImg = self.models.renderer(inputs, data, 
                                                      rad=self.opt.renderer_rad
                                                     ).permute(2,0,1).unsqueeze(0)
-        
-        # self.projGraph = self.renderer(self.ED_nodes).permute(2,0,1).unsqueeze(0)
 
     # Visualize the tracking & reconstruction results.
     def viz(self, inputs, sfdata, bid=0):
@@ -656,133 +626,126 @@ class Surfels():
         render_img = self.renderImg[bid]
         render_img = (255*render_img).type(torch.uint8).cpu()
 
-        img = inputs[("color", 0, 0)][bid]
+        img = inputs[("color", 0)][bid]
         img = (255*img).type(torch.uint8).cpu()
 
         if self.opt.num_classes == 2:
-            seman_colors = self.seman_conf[self.isStable]
-            seman_colors = torch.cat([seman_colors, torch.zeros_like(seman_colors[:, 0:1])], dim=1)
-            y_pred = self.models["renderer"](inputs, 
+            seg_colors = self.seg_conf[self.isStable]
+            seg_colors = torch.cat([seg_colors, torch.zeros_like(seg_colors[:, 0:1])], dim=1)
+            y_pred = self.models.renderer(inputs, 
                                             Data(points=self.points[self.isStable], 
-                                                 colors=seman_colors), 
+                                                 colors=seg_colors), 
                                             rad=self.opt.renderer_rad)
         elif self.opt.num_classes == 3:
-            y_pred = self.models["renderer"](inputs, 
+            y_pred = self.models.renderer(inputs, 
                                             Data(points=self.points[self.isStable], 
-                                                 colors=self.seman_conf[self.isStable]), 
+                                                 colors=self.seg_conf[self.isStable]), 
                                             rad=self.opt.renderer_rad)
         inval = torch.max(y_pred, dim=2)[0] < 1e-3
         # inval = torch.min(y_pred, dim=2)[0] >= 0.5
         y_pred = torch.argmax(y_pred, dim=2) + 1
         y_pred = torch_to_numpy(y_pred)
-        if ("seman_gt", 0) in inputs:
-            y_true = inputs[("seman_gt", 0)][0,0] + 1
-            y_true[inval] = 0
+
+        # if self.opt.save_raw_data:
+        #     raw_data_dir = os.path.join(self.output_dir, f"{os.path.basename(self.opt.sample_dir)}_raw_data", filename)
+        #     if not os.path.exists(raw_data_dir):
+        #         os.makedirs(raw_data_dir)
+
+        #     raw_img = torch_to_numpy(inputs[("color",0,0)][bid].permute(1,2,0))[...,::-1]
+        #     raw_img = 255 * raw_img
+        #     cv2.imwrite(os.path.join(raw_data_dir, "input.png"), raw_img[:, 32:-32])
+
+        #     raw_seg = id2color[torch_to_numpy(inputs[("seg",0)][bid, 0])]
+        #     cv2.imwrite(os.path.join(raw_data_dir, "seg_input.png"), raw_seg[:, 32:-32])
+
+        #     if ("disp",0) in inputs:
+        #         out_disp = torch_to_numpy(inputs[("disp",0)][bid,0])
+        #         out_disp[np.isnan(out_disp)] = 0
+        #         out_disp = 255 * out_disp / np.max(out_disp)
+        #         out_disp = cv2.applyColorMap(out_disp.astype(np.uint8), cv2.COLORMAP_MAGMA)
+        #         cv2.imwrite(os.path.join(raw_data_dir, "depth.png"), out_disp[:, 32:-32])
+
+        #     out_normal = inputs[("normal",0)].permute(0, 3, 1, 2)
+        #     # out_normal = blur_image(out_normal, kernel=31)
+        #     out_normal = out_normal[bid].permute(1, 2, 0)
+        #     out_normal = torch_to_numpy(out_normal)
+        #     out_normal[np.isnan(out_normal)] = 0
+        #     out_normal = 255 * out_normal
+        #     cv2.imwrite(os.path.join(raw_data_dir, "normal.png"), out_normal[:, 32:-32])
+
+        #     ### Smooth point cloud ###
+        #     disp_points = self.points[self.isStable][self.seg[self.isStable] < 2]
+        #     disp_colors = self.colors[self.isStable][self.seg[self.isStable] < 2]
+        #     disp_normals = torch.flip(numpy_to_torch(id2color), [1])[self.seg[self.isStable]][self.seg[self.isStable] < 2]
+
+        #     # disp_semans = self.seman[self.isStable][self.seman[self.isStable] < 2]
+        #     # seman_beef_valid = disp_semans == 0
+        #     # seman_beef_valid[seman_beef_valid] = disp_points[disp_semans==0, 2] < 1.2
+        #     # print(torch.unique(disp_points[disp_semans==0, 2]), torch.unique(disp_points[disp_semans==1, 2]))
+
+        #     pcd = o3d.geometry.PointCloud()
+        #     pcd.points = o3d.utility.Vector3dVector(disp_points.cpu().numpy())
+        #     pcd.colors = o3d.utility.Vector3dVector(disp_colors.cpu().numpy())
+        #     pcd.normals = o3d.utility.Vector3dVector(disp_normals.cpu().numpy())
             
-            y_true = torch_to_numpy(y_true)
-            self.result_dice += [general_dice(y_true, y_pred)]
-            self.result_jaccard += [general_jaccard(y_true, y_pred)]
+        #     pcd = pcd.voxel_down_sample(voxel_size=0.005)
+        #     _, ind = pcd.remove_statistical_outlier(nb_neighbors=50,
+        #                                             std_ratio=0.1)
+        #     pcd = pcd.select_by_index(ind)
 
-        if self.opt.save_raw_data:
-            raw_data_dir = os.path.join(self.output_dir, f"{os.path.basename(self.opt.sample_dir)}_raw_data", filename)
-            if not os.path.exists(raw_data_dir):
-                os.makedirs(raw_data_dir)
+        #     disp_points = numpy_to_torch(np.asarray(pcd.points), dtype=fl64_)
+        #     disp_colors = numpy_to_torch(np.asarray(pcd.colors), dtype=fl64_)
+        #     disp_seg_colors = numpy_to_torch(np.asarray(pcd.normals), dtype=fl64_)
+        #     ######
 
-            raw_img = torch_to_numpy(inputs[("color",0,0)][bid].permute(1,2,0))[...,::-1]
-            raw_img = 255 * raw_img
-            cv2.imwrite(os.path.join(raw_data_dir, "input.png"), raw_img[:, 32:-32])
-
-            raw_seman = id2color[torch_to_numpy(inputs[("seman",0)][bid, 0])]
-            cv2.imwrite(os.path.join(raw_data_dir, "seman_input.png"), raw_seman[:, 32:-32])
-
-            if ("disp",0) in inputs:
-                out_disp = torch_to_numpy(inputs[("disp",0)][bid,0])
-                out_disp[np.isnan(out_disp)] = 0
-                out_disp = 255 * out_disp / np.max(out_disp)
-                out_disp = cv2.applyColorMap(out_disp.astype(np.uint8), cv2.COLORMAP_MAGMA)
-                cv2.imwrite(os.path.join(raw_data_dir, "depth.png"), out_disp[:, 32:-32])
-
-            out_normal = inputs[("normal",0)].permute(0, 3, 1, 2)
-            # out_normal = blur_image(out_normal, kernel=31)
-            out_normal = out_normal[bid].permute(1, 2, 0)
-            out_normal = torch_to_numpy(out_normal)
-            out_normal[np.isnan(out_normal)] = 0
-            out_normal = 255 * out_normal
-            cv2.imwrite(os.path.join(raw_data_dir, "normal.png"), out_normal[:, 32:-32])
-
-            ### Smooth point cloud ###
-            disp_points = self.points[self.isStable][self.seman[self.isStable] < 2]
-            disp_colors = self.colors[self.isStable][self.seman[self.isStable] < 2]
-            disp_normals = torch.flip(numpy_to_torch(id2color), [1])[self.seman[self.isStable]][self.seman[self.isStable] < 2]
-
-            # disp_semans = self.seman[self.isStable][self.seman[self.isStable] < 2]
-            # seman_beef_valid = disp_semans == 0
-            # seman_beef_valid[seman_beef_valid] = disp_points[disp_semans==0, 2] < 1.2
-            # print(torch.unique(disp_points[disp_semans==0, 2]), torch.unique(disp_points[disp_semans==1, 2]))
-
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(disp_points.cpu().numpy())
-            pcd.colors = o3d.utility.Vector3dVector(disp_colors.cpu().numpy())
-            pcd.normals = o3d.utility.Vector3dVector(disp_normals.cpu().numpy())
+        #     theta = - 40 / 180 * np.pi
+        #     Rx = torch.tensor([[1, 0, 0], 
+        #                        [0, np.cos(theta), -np.sin(theta)], 
+        #                        [0, np.sin(theta), np.cos(theta)]], dtype=fl64_).cuda()
+        #     # rot_points = self.points[self.isStable]
+        #     rot_points = disp_points
+        #     rot_points_mean = rot_points.mean(0, keepdim=True)
+        #     rot_points = torch.matmul(rot_points - rot_points_mean, Rx.T) + rot_points_mean
             
-            pcd = pcd.voxel_down_sample(voxel_size=0.005)
-            _, ind = pcd.remove_statistical_outlier(nb_neighbors=50,
-                                                    std_ratio=0.1)
-            pcd = pcd.select_by_index(ind)
+        #     # out_data = Data(points=rot_points, 
+        #     #         colors=self.colors[self.isStable])
+        #     out_data = Data(points=rot_points, 
+        #             colors=disp_colors)
+        #     out_render_img = self.models["renderer"](inputs, out_data, rad=0.000002)
 
-            disp_points = numpy_to_torch(np.asarray(pcd.points), dtype=fl64_)
-            disp_colors = numpy_to_torch(np.asarray(pcd.colors), dtype=fl64_)
-            disp_seman_colors = numpy_to_torch(np.asarray(pcd.normals), dtype=fl64_)
-            ######
-
-            theta = - 40 / 180 * np.pi
-            Rx = torch.tensor([[1, 0, 0], 
-                               [0, np.cos(theta), -np.sin(theta)], 
-                               [0, np.sin(theta), np.cos(theta)]], dtype=fl64_).cuda()
-            # rot_points = self.points[self.isStable]
-            rot_points = disp_points
-            rot_points_mean = rot_points.mean(0, keepdim=True)
-            rot_points = torch.matmul(rot_points - rot_points_mean, Rx.T) + rot_points_mean
+        #     out_render_img = torch_to_numpy(255 * out_render_img)[:, :, ::-1]
+        #     cv2.imwrite(os.path.join(raw_data_dir, "raw_render_img.png"), out_render_img[:, 32:-32])
             
-            # out_data = Data(points=rot_points, 
-            #         colors=self.colors[self.isStable])
-            out_data = Data(points=rot_points, 
-                    colors=disp_colors)
-            out_render_img = self.models["renderer"](inputs, out_data, rad=0.000002)
+        #     # masked_colors=self.colors[self.isStable]
+        #     # masked_colors[self.seman[self.isStable] == 2] = 1
+        #     # out_data = Data(points=rot_points, 
+        #     #                 colors=masked_colors)
+        #     out_data = Data(points=rot_points, 
+        #                     colors=disp_seg_colors)
+        #     masked_out_render_img = self.models["renderer"](inputs, out_data, rad=0.000002)
+        #     # masked_out_render_img = torch_to_numpy(255 * masked_out_render_img)[:, :, ::-1]
+        #     masked_out_render_img = torch_to_numpy(masked_out_render_img)[:, :, ::-1]
+        #     cv2.imwrite(os.path.join(raw_data_dir, "render_img.png"), masked_out_render_img[:, 32:-32])
 
-            out_render_img = torch_to_numpy(255 * out_render_img)[:, :, ::-1]
-            cv2.imwrite(os.path.join(raw_data_dir, "raw_render_img.png"), out_render_img[:, 32:-32])
+        #     # out_data = Data(points=rot_points, 
+        #     #         colors=self.seman_conf[self.isStable])
+        #     # viz_y_pred = self.models["renderer"](inputs, out_data, rad=0.000002).argmax(2)
+        #     # viz_y_pred = id2color[torch_to_numpy(viz_y_pred)]
+        #     # viz_y_pred[torch_to_numpy(inval)] = 255
+        #     # cv2.imwrite(os.path.join(raw_data_dir, "render_seg.png"), viz_y_pred[:, 32:-32])
+
+        #     # rot_pcd = inputs[("pcd",0)][bid].type(fl64_)
+        #     # val_rot_pcd = torch.any(torch.isnan(rot_pcd), 2)
+        #     # rot_pcd = rot_pcd[val_rot_pcd]
+        #     # # rot_pcd_mean = rot_pcd.mean(0, keepdim=True)
+        #     # # rot_pcd = torch.matmul(rot_pcd - rot_pcd_mean, Rx.T) + rot_pcd_mean
+        #     # out_data = Data(points=rot_pcd, 
+        #     #         colors=inputs[("color", 0, 0)][bid].permute(1,2,0)[val_rot_pcd])
+        #     out_data = Data(points=sfdata.points, colors=sfdata.colors)
             
-            # masked_colors=self.colors[self.isStable]
-            # masked_colors[self.seman[self.isStable] == 2] = 1
-            # out_data = Data(points=rot_points, 
-            #                 colors=masked_colors)
-            out_data = Data(points=rot_points, 
-                            colors=disp_seman_colors)
-            masked_out_render_img = self.models["renderer"](inputs, out_data, rad=0.000002)
-            # masked_out_render_img = torch_to_numpy(255 * masked_out_render_img)[:, :, ::-1]
-            masked_out_render_img = torch_to_numpy(masked_out_render_img)[:, :, ::-1]
-            cv2.imwrite(os.path.join(raw_data_dir, "render_img.png"), masked_out_render_img[:, 32:-32])
-
-            # out_data = Data(points=rot_points, 
-            #         colors=self.seman_conf[self.isStable])
-            # viz_y_pred = self.models["renderer"](inputs, out_data, rad=0.000002).argmax(2)
-            # viz_y_pred = id2color[torch_to_numpy(viz_y_pred)]
-            # viz_y_pred[torch_to_numpy(inval)] = 255
-            # cv2.imwrite(os.path.join(raw_data_dir, "render_seg.png"), viz_y_pred[:, 32:-32])
-
-            # rot_pcd = inputs[("pcd",0)][bid].type(fl64_)
-            # val_rot_pcd = torch.any(torch.isnan(rot_pcd), 2)
-            # rot_pcd = rot_pcd[val_rot_pcd]
-            # # rot_pcd_mean = rot_pcd.mean(0, keepdim=True)
-            # # rot_pcd = torch.matmul(rot_pcd - rot_pcd_mean, Rx.T) + rot_pcd_mean
-            # out_data = Data(points=rot_pcd, 
-            #         colors=inputs[("color", 0, 0)][bid].permute(1,2,0)[val_rot_pcd])
-            out_data = Data(points=sfdata.points, colors=sfdata.colors)
-            
-            out_new_pcd_render = self.models["renderer"](inputs, out_data, rad=0.000002)
-            out_new_pcd_render = torch_to_numpy(255 * out_new_pcd_render)[:, :, ::-1]
-            cv2.imwrite(os.path.join(raw_data_dir, "new_pcd_render.png"), out_new_pcd_render[:, 32:-32])
+        #     out_new_pcd_render = self.models["renderer"](inputs, out_data, rad=0.000002)
+        #     out_new_pcd_render = torch_to_numpy(255 * out_new_pcd_render)[:, :, ::-1]
+        #     cv2.imwrite(os.path.join(raw_data_dir, "new_pcd_render.png"), out_new_pcd_render[:, 32:-32])
 
         if inputs["ID"] % self.opt.save_sample_freq == 0:
             # Draw the tracked points.
@@ -800,62 +763,60 @@ class Surfels():
             out = torch.cat([render_img, img], dim=1)
             out = torch_to_numpy(out.permute(1,2,0))
 
-            # Visualize mesh onto the image.
-            ed_y, ed_x, _, _ = pcd2depth(inputs, self.ED_nodes.points)
-            ed_pts = torch.stack([ed_x, ed_y], dim=1).cpu().numpy().astype(int)
-            boundary_edge_id = 0
-            id2color_strong = [(255, 0, 0), (255, 255, 0), (0, 255, 0)]
-            for k, edge_id1 in enumerate(self.ED_nodes.edge_index[0]):
-                edge_id2 = self.ED_nodes.edge_index[1][k]
-                if self.ED_nodes.seman[edge_id1] == self.ED_nodes.seman[edge_id2]:
-                    edge_color = id2color_strong[self.ED_nodes.seman[edge_id1]]#[::-1]
-                else:
-                    edge_color = (255, 255, 255)
-                if hasattr(self.ED_nodes, 'boundary_edge_type'):
-                    if self.ED_nodes.isBoundary[k]:
-                        if self.ED_nodes.boundary_edge_type[boundary_edge_id].mean() < 0.5:
-                            edge_color = (255, 0, 255)
-                        boundary_edge_id += 1
+            # # Visualize mesh onto the image.
+            # ed_y, ed_x, _, _ = pcd2depth(inputs, self.ED_nodes.points)
+            # ed_pts = torch.stack([ed_x, ed_y], dim=1).cpu().numpy().astype(int)
+            # boundary_edge_id = 0
+            # id2color_strong = [(255, 0, 0), (255, 255, 0), (0, 255, 0)]
+            # for k, edge_id1 in enumerate(self.ED_nodes.edge_index[0]):
+            #     edge_id2 = self.ED_nodes.edge_index[1][k]
+            #     if self.ED_nodes.seman[edge_id1] == self.ED_nodes.seman[edge_id2]:
+            #         edge_color = id2color_strong[self.ED_nodes.seman[edge_id1]]#[::-1]
+            #     else:
+            #         edge_color = (255, 255, 255)
+            #     if hasattr(self.ED_nodes, 'boundary_edge_type'):
+            #         if self.ED_nodes.isBoundary[k]:
+            #             if self.ED_nodes.boundary_edge_type[boundary_edge_id].mean() < 0.5:
+            #                 edge_color = (255, 0, 255)
+            #             boundary_edge_id += 1
 
-                pt1 = ed_pts[edge_id1]
-                pt2 = ed_pts[edge_id2]
+            #     pt1 = ed_pts[edge_id1]
+            #     pt2 = ed_pts[edge_id2]
                 
-                out = out.astype(np.uint8).copy()
-                # out = cv2.line(out, pt1, pt2, (255, 255, 255), 2)
-                out = cv2.line(out, pt1, pt2, edge_color, 1)
+            #     out = out.astype(np.uint8).copy()
+            #     # out = cv2.line(out, pt1, pt2, (255, 255, 255), 2)
+            #     out = cv2.line(out, pt1, pt2, edge_color, 1)
 
-            # for pt_pos, pt_seman in zip(ed_pts, self.ED_nodes.seman):
+            # if hasattr(self.ED_nodes, 'boundary_face_type'):
+            #     boundary_id = self.ED_nodes.isBoundaryFace.nonzero(as_tuple=True)[0]
+            #     mesh_out = copy.deepcopy(out)
+            #     for k, face_type in enumerate(self.ED_nodes.boundary_face_type[:, -1]):
+            #         tri_id1, tri_id2, tri_id3 = self.ED_nodes.triangles[:, boundary_id[k]]
+            #         vertices = torch.tensor([[ed_x[tri_id1], ed_y[tri_id1]], 
+            #                                 [ed_x[tri_id2], ed_y[tri_id2]], 
+            #                                 [ed_x[tri_id3], ed_y[tri_id3]]]).cpu().numpy().astype(np.int32)
+            #         if face_type == 1:
+            #             mesh_out = cv2.drawContours(mesh_out, [vertices], 0, (0, 255, 0), -1)
+            #         else:
+            #             # mesh_out = cv2.drawContours(mesh_out, [vertices], 0, (0, 0, 0), -1)
+            #             mesh_out = cv2.drawContours(mesh_out, [vertices], 0, (255, 0, 255), -1)
+            #     out = 0.6 * out + 0.4 * mesh_out
 
-            if hasattr(self.ED_nodes, 'boundary_face_type'):
-                boundary_id = self.ED_nodes.isBoundaryFace.nonzero(as_tuple=True)[0]
-                mesh_out = copy.deepcopy(out)
-                for k, face_type in enumerate(self.ED_nodes.boundary_face_type[:, -1]):
-                    tri_id1, tri_id2, tri_id3 = self.ED_nodes.triangles[:, boundary_id[k]]
-                    vertices = torch.tensor([[ed_x[tri_id1], ed_y[tri_id1]], 
-                                            [ed_x[tri_id2], ed_y[tri_id2]], 
-                                            [ed_x[tri_id3], ed_y[tri_id3]]]).cpu().numpy().astype(np.int32)
-                    if face_type == 1:
-                        mesh_out = cv2.drawContours(mesh_out, [vertices], 0, (0, 255, 0), -1)
-                    else:
-                        # mesh_out = cv2.drawContours(mesh_out, [vertices], 0, (0, 0, 0), -1)
-                        mesh_out = cv2.drawContours(mesh_out, [vertices], 0, (255, 0, 255), -1)
-                out = 0.6 * out + 0.4 * mesh_out
+            # # Put ID next to each tracked point.
+            # if (self.opt.data == "superv2" and filename == "000000") or \
+            # (self.opt.data == "superv1" and filename == "000010"):
+            #     out = out.astype(np.uint8).copy()
+            #     for k, pts in enumerate(self.track_pts["gt"][filename][:, 0:2]):
+            #         x = int(pts[0].item())
+            #         y = int(pts[1].item())
 
-            # Put ID next to each tracked point.
-            if (self.opt.data == "superv2" and filename == "000000") or self.opt.data == "superv1":
-            # if filename in self.track_pts["gt"]:
-                out = out.astype(np.uint8).copy()
-                for k, pts in enumerate(self.track_pts["gt"][filename][:, 0:2]):
-                    x = int(pts[0].item())
-                    y = int(pts[1].item())
-
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    org = (x-10, y+20)
-                    fontScale = 1
-                    color = (255, 0, 0)
-                    thickness = 1
-                    out = cv2.putText(out, str(k+1), org, font, 
-                    fontScale, color, thickness, cv2.LINE_AA)
+            #         font = cv2.FONT_HERSHEY_SIMPLEX
+            #         org = (x-10, y+20)
+            #         fontScale = 1
+            #         color = (255, 0, 0)
+            #         thickness = 1
+            #         out = cv2.putText(out, str(k+1), org, font, 
+            #         fontScale, color, thickness, cv2.LINE_AA)
 
             if ("disp",0) in inputs:
                 disp = torch_to_numpy(inputs[("disp",0)][bid,0])
@@ -865,18 +826,18 @@ class Surfels():
             disp = 255 * disp / np.max(disp)
             disp = cv2.applyColorMap(disp.astype(np.uint8), cv2.COLORMAP_MAGMA)
             outl = [disp]
-            if hasattr(self, 'seman'):
-                seman = inputs[("seman", 0)][bid, 0]
-                seman = torch_to_numpy(seman)
-                seman = id2color[seman]
+            if hasattr(self, 'seg'):
+                seg = inputs[("seg", 0)][bid, 0]
+                seg = torch_to_numpy(seg)
+                seg = id2color[seg]
                 # seman[torch_to_numpy(inputs[("seman_valid", 0)][bid, 0]) == 0] = 0
 
                 data = Data(points=self.points[self.isStable], 
-                            colors=numpy_to_torch(id2color)[self.seman[self.isStable]]) # radii=self.radii[self.isStable]
-                render_seman = self.models["renderer"](inputs, data, rad=self.opt.renderer_rad)
-                render_seman = torch_to_numpy(render_seman)
+                            colors=numpy_to_torch(id2color)[self.seg[self.isStable]]) # radii=self.radii[self.isStable]
+                render_seg = self.models.renderer(inputs, data, rad=self.opt.renderer_rad)
+                render_seg = torch_to_numpy(render_seg)
                 
-                outl += [seman, render_seman]
+                outl += [seg, render_seg]
             else:
                 outl += [np.zeros_like(disp)]
             outl = np.concatenate(outl, axis=0)

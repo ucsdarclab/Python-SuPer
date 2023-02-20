@@ -25,7 +25,6 @@ from PIL import Image
 import json
 from tqdm import tqdm
 
-from utils.config import *
 from utils.utils import *
 
 # model imports
@@ -136,13 +135,14 @@ def load_seg_model(classes_path, model_path):
 
 
 def generate_mask(seg_model, img):
-    img = img[None, ...].repeat(2, 1, 1, 1) # TODO: Solve the batch_size=1 bug.
+    N = img.size(0)
+    img = img.repeat(2, 1, 1, 1) # TODO: Solve the batch_size=1 bug.
 
     # Add option to reflect confidence level not mask
     seg = seg_model(img)
     seg = F.softmax(seg, dim=1)
 
-    return seg[0]
+    return seg[0:N]
 
 
 '''

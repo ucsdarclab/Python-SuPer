@@ -5,7 +5,6 @@ import argparse
 import pandas as pd
 
 from utils.utils import *
-from utils.config import *
 
 os.environ['CUDA_VISIBLE_DEVICES'] = "1"
 
@@ -72,7 +71,7 @@ def main():
                         default=1)
     parser.add_argument('--end_timestamp',
                         type=int,
-                        default=149) 
+                        default=519) 
     parser.add_argument('--traj_ids',
                         type=int,
                         nargs="+",  
@@ -163,7 +162,7 @@ def main():
     for key in results_array.keys():
         results_array[key] = np.stack(results_array[key], axis=0)
 
-    val_evaluate = torch.ones(args.num_points, dtype=bool_)
+    val_evaluate = torch.ones(args.num_points, dtype=torch.bool)
     val_evaluate[np.array(args.igonored_ids)-1] = False
     ind = np.arange(torch.count_nonzero(val_evaluate))
     offset = 0

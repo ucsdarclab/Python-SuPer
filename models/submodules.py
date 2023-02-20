@@ -2,6 +2,9 @@ from torch.utils.data import DataLoader
 import torchvision.transforms as T
 
 from torchvision.models.optical_flow import raft_large, raft_small
+from optical_flow.RAFT.raft import RAFT
+
+from collections import OrderedDict
 
 from graph.graph_encoder import *
 
@@ -14,8 +17,9 @@ import json
 from utils.data_loader import *
 
 # from depth.psm.stackhourglass import PSMNet
-import depth.monodepth2.resnet_encoder as mono2_resnet_encoder
-import depth.monodepth2.depth_decoder as mono2_depth_decoder
+import depth.monodepth2 as mono2
+# import depth.monodepth2.resnet_encoder as mono2_resnet_encoder
+# import depth.monodepth2.depth_decoder as mono2_depth_decoder
 
 import segmentation_models_pytorch as smp
 
@@ -87,82 +91,133 @@ class OccluMask(nn.Module):
 def init_nets(opt):
     models = {}
     
-    if opt.method in ['super', 'seman-super']:
+    if opt.method in ["super", "seman-super"]:
         models["super"] = SuPer(opt)
         models["mesh_encoder"] = DirectDeformGraph(opt)
     
+
+    # Renderer.
     if opt.renderer is not None:
         if opt.renderer == 'matrix_transform':
             models["renderer"] =  Projector(method="direct")
         elif opt.renderer == 'opencv':
             models["renderer"] =  Projector(method="opencv")
-        elif opt.renderer == 'pulsar':
+        elif opt.renderer == "pulsar":
             models["renderer"] =  Pulsar()
         elif opt.renderer in ['grid_sample', 'warp']:
             models["renderer"] =  Pulsar()
         else:
             assert False, "This renderer is not available."
-        
+
+
+    # Depth model.   
     if opt.num_layers > 0:
-        models["encoder"] = mono2_resnet_encoder.ResnetEncoder(
-            opt.num_layers, opt.weights_init == "pretrained")
+        assert not opt.load_depth, "Choose either one: use depth estimation model or load depth."
+        models["encoder"] = mono2.resnet_encoder.ResnetEncoder(
+                                opt.num_layers, 
+                                opt.weights_init == "pretrained"
+                            )
         # self.parameters_to_train += list(self.models["encoder"].parameters())
         
         if opt.pretrained_encoder_checkpoint_dir is not None:
-             models["encoder"] = load_checkpoints(models["encoder"], 
-                    opt.pretrained_encoder_checkpoint_dir, model_key="encoder")
+            models["encoder"] = load_checkpoints(models["encoder"], 
+                                    opt.pretrained_encoder_checkpoint_dir, 
+                                    model_key="encoder"
+                                )
 
     if opt.depth_model is not None:
+        assert not opt.load_depth, "Choose either one: use depth estimation model or load depth."
         if opt.depth_model == 'monodepth2_stereo':
-            models["depth"] = mono2_depth_decoder.DepthDecoder(
-                opt, models["encoder"].num_ch_enc, opt.scales)
+            models["depth"] = mono2.depth_decoder.DepthDecoder(
+                opt, models["encoder"].num_ch_enc, opt.scales)  # TODO: Remove semantic output.
 
         # elif opt.depth_model == 'psm':
         #     models["depth"] = PSMNet(opt)
-            
+
         if opt.pretrained_depth_checkpoint_dir is not None:
             models["depth"] = load_checkpoints(models["depth"], 
                 opt.pretrained_depth_checkpoint_dir, model_key="depth")
 
+
+    # Segmentation model.
+    if opt.seg_model is not None:
+        assert not opt.load_seman, "Choose either one: use segmentation model or load segmentation mask."
+        
+        if opt.seg_num_layers is not None:
+            seg_num_layers = opt.seg_num_layers
+        else:
+            seg_num_layers = opt.num_layers
+        
+        if not opt.share_depth_seg_model and opt.seg_model in ["adabins", "monodepth2_stereo"]:
+            models["seg_encoder"] = mono2.seg_resnet_encoder.ResnetEncoder(
+                                        seg_num_layers, 
+                                        opt.weights_init == "pretrained"
+                                    )
+
+            if opt.pretrained_seg_checkpoint_dir is not None:
+                models["seg_encoder"] = load_checkpoints(models["seg_encoder"], 
+                                            opt.pretrained_seg_checkpoint_dir, 
+                                            model_key="encoder", 
+                                            state_pairs=("encoder", "seg_encoder")
+                                        )
+
     if opt.seg_model is not None and not opt.load_seman:
         if opt.seg_model == 'deeplabv3':
             models["seman"] = smp.DeepLabV3Plus(
-                encoder_name="resnet18",
+                encoder_name=f"resnet{seg_num_layers}",
                 in_channels=3,
                 classes=opt.num_classes
             )
 
         elif opt.seg_model == 'unet':
             models["seman"] = smp.Unet(
-                encoder_name="resnet18",
+                encoder_name=f"resnet{seg_num_layers}",
                 in_channels=3,
                 classes=opt.num_classes
             )
 
         elif opt.seg_model == 'unet++':
             models["seman"] = smp.UnetPlusPlus(
-                encoder_name="resnet18",
+                encoder_name=f"resnet{seg_num_layers}",
                 in_channels=3,
                 classes=opt.num_classes
             )
         
         elif opt.seg_model == 'manet':
             models["seman"] = smp.MAnet(
-                encoder_name="resnet18",
+                encoder_name=f"resnet{seg_num_layers}",
                 in_channels=3,
                 classes=opt.num_classes
             )
-        
+
+        # elif opt.seg_model == "monodepth2_stereo":
+        #     if not opt.share_depth_seg_model:
+        #         models["seman"] = mono2.seg_decoder.DepthDecoder(
+        #             opt, models["encoder"].num_ch_enc, opt.scales) # TODO: Remove depth output.
+
+        #         models["seman"] = load_checkpoints(models["seman"], 
+        #                 opt.pretrained_seg_checkpoint_dir, 
+        #                 model_key="depth",
+        #                 state_pairs=("decoder", "sep_decoder"))
+
         if opt.pretrained_seg_checkpoint_dir is not None:
-            models["seman"] = load_checkpoints(models["seman"], opt.pretrained_seg_checkpoint_dir,
-                                                model_key='state_dict')
-            models["seman"].eval()
+            if not opt.seg_model in ["adabins", "monodepth2_stereo"]:
+                models["seman"] = load_checkpoints(models["seman"], opt.pretrained_seg_checkpoint_dir,
+                                                    model_key='state_dict')
+            # models["seman"].eval()
 
     if opt.optical_flow_model == 'raft_small':
         models["optical_flow"] = raft_small(pretrained=True, progress=True)
     elif opt.optical_flow_model == 'raft_large':
         models["optical_flow"] = raft_large(pretrained=True, progress=True)
+    elif opt.optical_flow_model == "raft_github":
+        models["optical_flow"] = RAFT(opt)
 
+        if opt.pretrained_optical_flow_checkpoint_dir is not None:
+            models["optical_flow"] = load_checkpoints(models["optical_flow"], 
+                                                    opt.pretrained_optical_flow_checkpoint_dir,
+                                                    state_pairs=("module.", ""))
+                                                    # strict=True
     # if opt.bn_morph:
     #     models["OccluMask"] = OccluMask().cuda()
 
@@ -208,15 +263,39 @@ def init_nets(opt):
     #             torch.load(f"{args.depth_est_method}_exp{args.mod_id}_end.pt"))
     #     nets["depth"] = depth_est_net
 
-def load_checkpoints(model, model_path, model_key=None):
+def load_checkpoints(model, model_path, model_key=None, state_pairs=None, strict=False):
     if os.path.exists(model_path):
         state = torch.load(model_path)
-        
         if isinstance(state, dict):
-            assert model_key is not None, "A model_key is needed to extract model parameters."
-            model.load_state_dict(state[model_key], strict=False)
-            print(f"Restored model with key {model_key}")
+            # assert model_key is not None, "A model_key is needed to extract model parameters."
+            if not model_key in state:
+                model_key = "state_dict"
             
+            if state_pairs is None:
+                if model_key is None:
+                    model.load_state_dict(state, strict=strict)
+                else:
+                    model.load_state_dict(state[model_key], strict=strict)
+                print(f"Restored model with key {model_key}")
+            else:
+                old_state, new_state = state_pairs
+                new_state_dict = OrderedDict()
+                if model_key is None:
+                    for key, value in state.items():
+                        new_key = key.replace(old_state, new_state)
+                        # print(key, '--->', new_key)
+                        new_state_dict[new_key] = value
+                else:
+                    for key, value in state[model_key].items():
+                        # new_key = key
+                        # for state_pair in state_pairs:
+                        #     old_state, new_state = state_pair
+                        #     new_key = new_key.replace(old_state, new_state)
+                        new_key = key.replace(old_state, new_state)
+                        # print(key, '--->', new_key)
+                        new_state_dict[new_key] = value
+                model.load_state_dict(new_state_dict, strict=strict)
+                print(f"Restored model with key {model_key}, change key from {old_state} ---> {new_state}.")
     return model
 
 def prepare_folders(args: dict,):
@@ -269,7 +348,6 @@ def init_dataset(opts, models=None):
         assert False, "TODO: Write the code."
     
     else:
-        # testset = SuPerDataset(opts, normalize, models=models)
         testset = SuPerDataset(opts, T.ToTensor(), models=models)
         testloader = DataLoader(testset, 1, shuffle=False)
         return testloader

@@ -7,7 +7,6 @@ from torch import nn
 from pytorch3d.renderer.points.pulsar import Renderer
 from pytorch3d.transforms import matrix_to_rotation_6d
 
-from utils.config import *
 from utils.utils import *
 
 class Pulsar(nn.Module):
@@ -15,8 +14,10 @@ class Pulsar(nn.Module):
     Pulsar in PyTorch modules.
     Ref: Pulsar: Efficient Sphere-based Neural Rendering
     """
-    def __init__(self) -> None:
+    def __init__(self, opt) -> None:
         super(Pulsar, self).__init__()
+        self.height = opt.height
+        self.width = opt.width
         self.gamma = 1.0e-5
 
     def get_cam_params(self, inputs, view_scale, opencv=True):
@@ -25,13 +26,13 @@ class Pulsar(nn.Module):
             [[-1.0, 0.0, 0.0],
             [0.0, 1.0, 0.0],
             [0.0,  0.0, 1.0]], 
-            dtype=fl32_).cuda()
+            dtype=torch.float32).cuda()
         r = matrix_to_rotation_6d(R)
         
         focal_length = 0.01
-        h, w = int(inputs["height"] * view_scale), int(inputs["width"] * view_scale)
-        cx, cy = inputs["cx"] * view_scale, inputs["cy"] * view_scale
-        fx = inputs["fx"] * view_scale
+        h, w = int(self.height * view_scale), int(self.width * view_scale)
+        cx, cy = inputs["K"][0,0,2] * view_scale, inputs["K"][0,1,2] * view_scale
+        fx = inputs["K"][0,0,0] * view_scale
 
         cam_params = torch.tensor([
             0.0,
@@ -43,7 +44,7 @@ class Pulsar(nn.Module):
             (focal_length * w) / fx,
             -math.ceil(cx - w / 2),
             -math.ceil(cy - h / 2),
-        ], dtype=fl32_).cuda()
+        ], dtype=torch.float32).cuda()
         return cam_params
 
     def forward(self, inputs, data, colors=None, view_scale=1.0, rad=0.01, bg_col=torch.tensor([0.0, 0.0, 0.0]).cuda()):
@@ -54,14 +55,13 @@ class Pulsar(nn.Module):
         surfel_num = len(points)
         
         # Points
-        vert_pos = points.type(fl32_)
+        vert_pos = points.type(torch.float32)
 
         # Colors
-        vert_col = colors.type(fl32_)
+        vert_col = colors.type(torch.float32)
 
         # Radii of points
-        vert_rad = torch.ones(surfel_num, dtype=fl32_).cuda() * rad
-        # vert_rad = data.radii.type(fl32_)
+        vert_rad = torch.ones(surfel_num, dtype=torch.float32).cuda() * rad
         
         # Camera params
         cam_params = self.get_cam_params(inputs, view_scale)
@@ -69,8 +69,8 @@ class Pulsar(nn.Module):
         # The volumetric optimization works better with a higher number of tracked
         # intersections per ray.
         renderer = Renderer(
-            int(inputs["width"] * view_scale),
-            int(inputs["height"] * view_scale),
+            int(self.width * view_scale),
+            int(self.height * view_scale),
             surfel_num, n_track=64, right_handed_system=True
         ).cuda()
 

@@ -41,10 +41,7 @@ from torchvision.transforms import (
 # from models.preprocessing import *
 from super.loss import *
 
-from utils.config import *
 from utils.utils import *
-
-from bnmorph.layers import grad_computation_tools
 
 class DirectDeformGraph(nn.Module):
     '''
@@ -54,10 +51,6 @@ class DirectDeformGraph(nn.Module):
     def __init__(self, opt) -> None:
         super(DirectDeformGraph, self).__init__()
         self.opt = opt
-
-        # if self.opt.method == "seman-super":
-        #     self.tool = grad_computation_tools(batch_size=self.opt.batch_size, height=self.opt.height,
-        #                                        width=self.opt.width).cuda()
 
     def select_ED_nodes(self, points, norms, seman_conf=None, downsample_params=None, method='ball_pivoting'):
         if method=='ball_pivoting':
@@ -180,7 +173,7 @@ class DirectDeformGraph(nn.Module):
             triangles_areas = None
         
         elif edge_identify_method == 'grid_mesh':
-            if self.opt.hard_seman and False:
+            if self.opt.hard_seg and False:
                 seman_map = - torch.ones_like(data.index_map)
                 seman_map[data.index_map >= 0] = data.seman.to(data.index_map.device)
                 val_points = []
@@ -217,7 +210,7 @@ class DirectDeformGraph(nn.Module):
             seman = torch.argmax(seman_conf, dim=1)
 
             # If hard_seman, delete the boundary edges.
-            if self.opt.hard_seman and (self.opt.mesh_edge or self.opt.mesh_face):
+            if self.opt.hard_seg and (self.opt.mesh_edge or self.opt.mesh_face):
                 inside_edges = seman[edge_index[0]] == seman[edge_index[1]]
                 edge_index = torch.stack([edge_index[0][inside_edges], edge_index[1][inside_edges]], dim=0)
 
@@ -251,7 +244,7 @@ class DirectDeformGraph(nn.Module):
 
         points = data.points
         norms = data.norms
-        valid = data.valid.view(inputs["height"], inputs["width"])
+        valid = data.valid.view(self.opt.height, self.opt.width)
 
         # Find ED nodes near the boundary.
         # if self.opt.method == "seman-super" and False:
@@ -309,9 +302,9 @@ class DirectDeformGraph(nn.Module):
         # downsample_params=[(0.05, 40, 0.5)]
         # ball_piv_radii = [0.04, 0.08, 0.1]
         downsample_params = [tuple(self.opt.downsample_params[i * 3: (i + 1) * 3]) for i in range(int(len(self.opt.downsample_params)/3))]
-        if hasattr(data, 'seman'):
-            ED_points, ED_norms, radii, edge_index, triangles, triangles_areas, isBoundary, seman, seman_conf = self.init_ED_nodes(inputs, data, points, norms,
-                candidates_seman=data.seman, candidates_seman_conf=data.seman_conf,
+        if hasattr(data, 'seg'):
+            ED_points, ED_norms, radii, edge_index, triangles, triangles_areas, isBoundary, seg, seg_conf = self.init_ED_nodes(inputs, data, points, norms,
+                candidates_seman=data.seg, candidates_seman_conf=data.seg_conf,
                 downsample_params=downsample_params, ball_piv_radii=self.opt.ball_piv_radii)
         else:
             ED_points, ED_norms, radii, edge_index, triangles, triangles_areas, _, _, _ = self.init_ED_nodes(inputs, data, points, norms, 
@@ -319,21 +312,17 @@ class DirectDeformGraph(nn.Module):
         num = len(ED_points)
         edges_lens = torch_distance(ED_points[edge_index[0]], ED_points[edge_index[1]])
 
-        if self.opt.method == 'seman-super':
-            isBoundary = ~(seman[edge_index[0]] == seman[edge_index[1]])
-            isBoundaryFace = ~((seman[triangles[0]] == seman[triangles[1]]) & (seman[triangles[0]] == seman[triangles[2]]))
+        if self.opt.method == 'semantic-super':
+            isBoundary = ~(seg[edge_index[0]] == seg[edge_index[1]])
+            isBoundaryFace = ~((seg[triangles[0]] == seg[triangles[1]]) & (seg[triangles[0]] == seg[triangles[2]]))
 
-            if self.opt.use_edge_ssim_hints:
-                if self.opt.mesh_edge:
-                    boundary_edge_type = torch.ones((torch.count_nonzero(isBoundary), 10), dtype=fl32_).cuda()
-                if self.opt.mesh_face:
-                    boundary_face_type = torch.ones((torch.count_nonzero(isBoundaryFace), 10), dtype=fl32_).cuda()
+            # if self.opt.use_edge_ssim_hints:
+            #     if self.opt.mesh_edge:
+            #         boundary_edge_type = torch.ones((torch.count_nonzero(isBoundary), 10), dtype=fl32_).cuda()
+            #     if self.opt.mesh_face:
+            #         boundary_face_type = torch.ones((torch.count_nonzero(isBoundaryFace), 10), dtype=fl32_).cuda()
 
-            isTool = (seman[edge_index[0]] == 2) & (seman[edge_index[1]] == 2)
-
-        # # TODO
-        # edges_weights = edges_lens.reshape(len(ED_points), self.opt.num_ED_neighbors)
-        # edges_weights = torch.flatten(F.softmax(edges_weights, dim=1))
+            isTool = (seg[edge_index[0]] == 2) & (seg[edge_index[1]] == 2)
 
         graph = Data(points=ED_points, norms=ED_norms, radii=radii,
             edge_index=edge_index, edges_lens=edges_lens,
@@ -342,24 +331,23 @@ class DirectDeformGraph(nn.Module):
             # TODO edges_weights=edges_weights
             # index_map=index_map, 
             # neighbor_radii=[neighbor_radii],
-        if hasattr(data, 'seman'):
-            graph.seman = seman
-            graph.seman_conf = seman_conf
+        if hasattr(data, 'seg'):
+            graph.seg = seg
+            graph.seg_conf = seg_conf
             graph.isBoundary = isBoundary
-            if self.opt.method == 'seman-super':
+            if self.opt.method == 'semantic-super':
                 graph.isBoundaryFace = isBoundaryFace
             
-            graph.inside_edges = seman[edge_index[0]] == seman[edge_index[1]]
-            graph.static_ed_nodes = torch.zeros(num, dtype=bool_).cuda()
+            graph.inside_edges = seg[edge_index[0]] == seg[edge_index[1]]
+            graph.static_ed_nodes = torch.zeros(num, dtype=torch.bool).cuda()
 
-        if self.opt.method == 'seman-super':
-            if self.opt.use_edge_ssim_hints:
-                if self.opt.mesh_edge:
-                    graph.boundary_edge_type = boundary_edge_type
-                if self.opt.mesh_face:
-                    graph.boundary_face_type = boundary_face_type
+        if self.opt.method == 'semantic-super':
+            # if self.opt.use_edge_ssim_hints:
+            #     if self.opt.mesh_edge:
+            #         graph.boundary_edge_type = boundary_edge_type
+            #     if self.opt.mesh_face:
+            #         graph.boundary_face_type = boundary_face_type
             graph.isTool = isTool
-        #     graph.seman_edge_val=seman_edge_val
 
         return graph
 

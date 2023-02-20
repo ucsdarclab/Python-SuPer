@@ -205,9 +205,6 @@ def get_smooth_loss(disp, img):
     """
     grad_disp_x = torch.abs(disp[:, :, :, :-1] - disp[:, :, :, 1:])
     grad_disp_y = torch.abs(disp[:, :, :-1, :] - disp[:, :, 1:, :])
-    # if grad_disp_x.size(1) > 1:
-    #     grad_disp_x = grad_disp_x.mean(1, keepdim=True)
-    #     grad_disp_y = grad_disp_y.mean(1, keepdim=True)
 
     grad_img_x = torch.mean(torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:]), 1, keepdim=True)
     grad_img_y = torch.mean(torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :]), 1, keepdim=True)
@@ -231,16 +228,17 @@ def compute_reprojection_loss(pred, target):
 
     return reprojection_loss
 
+
 class SSIM(nn.Module):
     """Layer to compute the SSIM loss between a pair of images
     """
-    def __init__(self, window=3):
+    def __init__(self):
         super(SSIM, self).__init__()
-        self.mu_x_pool   = nn.AvgPool2d(window, 1)
-        self.mu_y_pool   = nn.AvgPool2d(window, 1)
-        self.sig_x_pool  = nn.AvgPool2d(window, 1)
-        self.sig_y_pool  = nn.AvgPool2d(window, 1)
-        self.sig_xy_pool = nn.AvgPool2d(window, 1)
+        self.mu_x_pool   = nn.AvgPool2d(3, 1)
+        self.mu_y_pool   = nn.AvgPool2d(3, 1)
+        self.sig_x_pool  = nn.AvgPool2d(3, 1)
+        self.sig_y_pool  = nn.AvgPool2d(3, 1)
+        self.sig_xy_pool = nn.AvgPool2d(3, 1)
 
         self.refl = nn.ReflectionPad2d(1)
 
@@ -262,6 +260,7 @@ class SSIM(nn.Module):
         SSIM_d = (mu_x ** 2 + mu_y ** 2 + self.C1) * (sigma_x + sigma_y + self.C2)
 
         return torch.clamp((1 - SSIM_n / SSIM_d) / 2, 0, 1)
+
 
 class AdaSSIM(nn.Module):
     """Layer to compute the SSIM between a pair of windows
@@ -295,7 +294,7 @@ class AdaSSIM(nn.Module):
 
         return SSIM_n / SSIM_d
 
-
+        
 def compute_depth_errors(gt, pred):
     """Computation of error metrics between predicted and ground truth depths
     """

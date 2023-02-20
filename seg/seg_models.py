@@ -4,7 +4,6 @@ import cv2
 
 import torch.nn.functional as F
 
-from utils.config import *
 from utils.utils import *
 
 

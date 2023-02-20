@@ -1,3 +1,4 @@
+import numpy as np
 import os
 import sys
 import shutil
@@ -8,15 +9,14 @@ from PIL import Image, ImageColor, ImageDraw, ImageFont
 import torch
 import torch.nn as nn
 
+import torch.nn.functional as F
+
 from pytorch3d.ops import (
     ball_query,
     knn_points,
 )
 
-from utils.config import *
-
-
-def get_grid_coords(h, w, dtype=long_, batch_size=None, stack_dim=None):
+def get_grid_coords(h, w, dtype=torch.long, batch_size=None, stack_dim=None):
     """
     Get grids of x,y coordinates.
     """
@@ -151,7 +151,7 @@ def blur_image(imgs, method="pyt-gauss", kernel=15):
 def torch_to_numpy(inputs):
     return inputs.detach().cpu().numpy()
 
-def numpy_to_torch(inputs, dtype=fl32_, to_gpu=True):
+def numpy_to_torch(inputs, dtype=torch.float32, to_gpu=True):
     if to_gpu:
         return torch.as_tensor(inputs, dtype=dtype).cuda()
     else:
@@ -168,6 +168,26 @@ def torch_distance(a,b,keepdim=False):
 
 def torch_sq_distance(a, b, dim=-1, keepdim=False):
     return torch.pow(a - b, 2).sum(dim)
+
+def torch_resize(inputs, size, mode='bilinear'):
+    """
+    size: float or tuple(int, int, ...)
+    inputs: BxCxHxW
+    """
+    assert isinstance(size, float) or (isinstance(size, tuple) and isinstance(size[0], int)), \
+        "Size should be either a float or tuple of ints."
+    inputs = inputs.type(fl32_)
+    if isinstance(size, float):
+        return F.interpolate(inputs, scale_factor=size, mode=mode)
+    else:
+        return F.interpolate(inputs, size=size, mode=mode)
+
+def torch_dilate(inputs, kernel=10, dtype=torch.bool):
+    B, C, H, W = inputs.size() 
+    kernel_tensor = torch.ones((C, 1, kernel, kernel)).to(inputs.device)
+    outputs = F.conv2d(inputs, kernel_tensor, padding='same', groups=C)
+    outputs = (outputs > 0).type(dtype)
+    return outputs
 
 # def torch_delete(inputs, indexs):
 #     mask = torch.ones(len(inputs), dtype=bool).cuda()
@@ -186,49 +206,19 @@ def torch_sq_distance(a, b, dim=-1, keepdim=False):
 # def pcd2depth(inputs, pcd, round_coords=True, conf_sort=False, conf=None, valid_margin=0):
 def pcd2depth(inputs, pcd, round_coords=True, valid_margin=0):
 
+    height, width = inputs[("color",0)][0,0].size()
+
     X = pcd[...,0]
     Y = pcd[...,1]
     Z = (pcd[...,2] + 1e-8)
     
-    u_ = X * inputs["fx"] / Z + inputs["cx"]
-    v_ = Y * inputs["fy"] / Z + inputs["cy"]
+    u_ = X * inputs["K"][0,0,0] / Z + inputs["K"][0,0,2]
+    v_ = Y * inputs["K"][0,1,1] / Z + inputs["K"][0,1,2]
     u = torch.round(u_).long()
     v = torch.round(v_).long()
-    coords = v * inputs["width"] + u
-    valid_proj = (v >= valid_margin) & (v < inputs["height"]-1-valid_margin) & \
-        (u >= valid_margin) & (u < inputs["width"]-1-valid_margin)
-
-    # if depth_sort or conf_sort:
-
-    #     # Keep only the valid projections.
-    #     Z = Z[valid_proj]
-    #     coords = coords[valid_proj]
-    #     indicies = valid_proj.nonzero(as_tuple=True)[0]
-
-    #     # Sort based on depth or confidence.
-    #     if depth_sort:
-    #         _, sort_indices = torch.sort(Z) # Z(depth) from small to large.
-    #     elif conf_sort:
-    #         _, sort_indices = torch.sort(conf[valid_proj])
-    #     coords, indicies = coords[sort_indices], indicies[sort_indices]
-
-    #     # Sort based on coordinate.
-    #     coords, sort_indices = torch.sort(coords, stable=True)
-    #     indicies = indicies[sort_indices]
-    #     coords, counts = torch.unique_consecutive(coords, return_counts=True)
-    #     counts = torch.cat([torch.tensor([0]).cuda(), \
-    #         torch.cumsum(counts[:-1], dim=0)])
-    #     indicies = indicies[counts]
-
-    #     if round_coords:
-    #         return v[indicies], u[indicies], coords, indicies
-    #     else:
-    #         return v_[indicies], u_[indicies], coords, indicies
-    # else:
-    # if round_coords:
-    #     return v, u, coords[valid_proj], valid_proj
-    # else:
-    #     return v_, u_, coords[valid_proj], valid_proj
+    coords = v * width + u
+    valid_proj = (v >= valid_margin) & (v < height-1-valid_margin) & \
+        (u >= valid_margin) & (u < width-1-valid_margin)
 
     if round_coords:
         return v, u, coords, valid_proj
@@ -317,6 +307,33 @@ def erode_dilate_seg(seg, kernel=31):
         valid_seg &= class_seg == pyt_dilate(pyt_erode(class_seg.type(fl32_)))
 
     return valid_seg
+
+def find_edge_region(x, num_classes=0, class_list=None, kernel=11, ignore_img_edge=True):
+    assert x.dim()==4
+    if x.size(1) > 1:
+        x = torch.argmax(x, dim=1, keepdim=True)
+    b, _, h, w = x.size()
+    if class_list is None:
+        class_list = torch.unique(x)
+    N = len(class_list)
+
+    label_map = torch.ones(num_classes).to(x.device) * N
+    for k, class_id in enumerate(class_list):
+        label_map[class_id] = k
+    class_mask = F.one_hot(label_map[x].long())[...,0:N].permute(0, 4, 1, 2, 3)
+
+    erode_class_mask = torch_dilate(1. - class_mask.reshape(-1, 1, h, w), 
+                                    kernel=kernel)
+    erode_class_mask = erode_class_mask.reshape(b, -1, 1, h, w)
+    edge_mask = torch.any(erode_class_mask & class_mask.bool(), 1)
+
+    if ignore_img_edge:
+        edge_mask[:, :, 0:kernel] = False
+        edge_mask[:, :, -kernel:] = False
+        edge_mask[:, :, :, 0:kernel] = False
+        edge_mask[:, :, :, -kernel:] = False
+
+    return edge_mask
 
 class CustomLogManager:
     '''

@@ -31,14 +31,19 @@ class DepthDecoder(nn.Module):
         self.num_ch_dec = np.array([16, 32, 64, 128, 256])
 
         self.convs = OrderedDict()
+        self.seg_convs = OrderedDict()
 
         # Segmentation head
-        if self.opt.seg_model == self.opt.depth_model and self.opt.share_depth_seg_model:
-            self.seg_convs = OrderedDict()
-            self.seg_convs["seg_dispconv"] = nn.Sequential(
-                seg_layers.DoubleConv(np.sum(self.num_ch_dec), 128),
-                seg_layers.OutConv(128, self.opt.num_classes)
-            )
+        # if self.opt.seg_model == self.opt.depth_model:
+            # self.seg_convs = OrderedDict()
+        self.seg_convs["seman_dispconv"] = nn.Sequential(
+            seg_layers.DoubleConv(np.sum(self.num_ch_dec), 128),
+            seg_layers.OutConv(128, self.opt.num_classes)
+        )
+        # self.seman_dispconv = nn.Sequential(
+        #     seg_layers.DoubleConv(np.sum(self.num_ch_dec), 128),
+        #     seg_layers.OutConv(128, self.opt.num_classes)
+        # )
 
         # decoder
         for i in range(4, -1, -1):
@@ -54,20 +59,20 @@ class DepthDecoder(nn.Module):
             num_ch_out = self.num_ch_dec[i]
             self.convs[("upconv", i, 1)] = ConvBlock(num_ch_in, num_ch_out)
 
-        for s in self.scales:
-            # if self.opt.bins_regression:
-            #     self.convs[("dispconv", s)] = Conv3x3(self.num_ch_dec[s], self.opt.num_bins)
-            #     # bin_width = (1./self.opt.min_depth - 1./self.opt.max_depth) / self.opt.num_bins
-            #     # self.bins = bin_width * (torch.arange(self.opt.num_bins) + 0.5) + 1./self.opt.max_depth
-            #     bin_width = (self.opt.max_depth - self.opt.min_depth) / self.opt.num_bins
-            #     self.bins = bin_width * (torch.arange(self.opt.num_bins) + 0.5) + self.opt.min_depth
-            #     self.bins = self.bins[None, :, None, None].cuda()
-            # else:
-            self.convs[("dispconv", s)] = Conv3x3(self.num_ch_dec[s], self.num_output_channels)
+        # for s in self.scales:
+        #     # if self.opt.bins_regression:
+        #     #     self.convs[("dispconv", s)] = Conv3x3(self.num_ch_dec[s], self.opt.num_bins)
+        #     #     # bin_width = (1./self.opt.min_depth - 1./self.opt.max_depth) / self.opt.num_bins
+        #     #     # self.bins = bin_width * (torch.arange(self.opt.num_bins) + 0.5) + 1./self.opt.max_depth
+        #     #     bin_width = (self.opt.max_depth - self.opt.min_depth) / self.opt.num_bins
+        #     #     self.bins = bin_width * (torch.arange(self.opt.num_bins) + 0.5) + self.opt.min_depth
+        #     #     self.bins = self.bins[None, :, None, None].cuda()
+        #     # else:
+        #     self.convs[("dispconv", s)] = Conv3x3(self.num_ch_dec[s], self.num_output_channels)
 
-        self.decoder = nn.ModuleList(list(self.convs.values()))
-        if self.opt.seg_model == self.opt.depth_model and self.opt.share_depth_seg_model:
-            self.seg_decoder = nn.ModuleList(list(self.seg_convs.values()))
+        self.sep_decoder = nn.ModuleList(list(self.convs.values()))
+        # if self.opt.seg_model == self.opt.depth_model:
+        self.seg_sep_decoder = nn.ModuleList(list(self.seg_convs.values()))
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, rst, data, nets):
@@ -76,12 +81,12 @@ class DepthDecoder(nn.Module):
 
         # decoder
         x = input_features[-1]
-        if self.opt.seg_model == self.opt.depth_model and self.opt.share_depth_seg_model:
+        if self.opt.seg_model == self.opt.depth_model:
             features = []
         for i in range(4, -1, -1):
             x = self.convs[("upconv", i, 0)](x)
             
-            if self.opt.seg_model == self.opt.depth_model and self.opt.share_depth_seg_model:
+            if self.opt.seg_model == self.opt.depth_model:
                 features += [x]
             
             x = [upsample(x)]
@@ -90,26 +95,21 @@ class DepthDecoder(nn.Module):
             x = torch.cat(x, 1)
             x = self.convs[("upconv", i, 1)](x)
 
-            # if (self.opt.feature_loss or self.opt.optical_flow_model == "raft_github"):
-            #     if i == 4:
-            #         self.outputs["disp_feature"] = [x]
-            #     elif i >= 3:
-            #         self.outputs["disp_feature"].append(x)
-                
-            #     if i == 0:
-            #         self.outputs["disp_feature"] = torch.cat([F.interpolate(fmap, 
-            #                                                                 self.outputs["disp_feature"][-1].size()[2:], 
-            #                                                                 mode="bilinear") \
-            #                                                  for fmap in self.outputs["disp_feature"]]
-            #                                                  , dim=1)
+            if (self.opt.feature_loss or self.opt.optical_flow_model == "raft_github") and i == 0:
+                self.outputs["seg_feature"] = x
             
-            if i in self.scales:
-                self.outputs[("disp", i)] = self.sigmoid(self.convs[("dispconv", i)](x))
+            # if i in self.scales:
+            #     # if self.opt.bins_regression:
+            #     #     logit = F.softmax(self.convs[("dispconv", i)](x), dim=1)
+            #     #     self.outputs[("depth", i)] = (logit * self.bins).sum(1, keepdims=True)
+            #     # else:
+            #     self.outputs[("disp", i)] = self.sigmoid(self.convs[("dispconv", i)](x))
 
-        if self.opt.seg_model == self.opt.depth_model and self.opt.share_depth_seg_model:
-            features = torch.cat([torch_resize(feature, features[-1].size()[2:]) \
-                for feature in features], dim=1)
-            self.outputs["seg"] = self.seg_convs["seg_dispconv"](features)
+        # if self.opt.seg_model == self.opt.depth_model:
+        features = torch.cat([torch_resize(feature, features[-1].size()[2:]) \
+            for feature in features], dim=1)
+        self.outputs["seman"] = self.seg_convs["seman_dispconv"](features)
+        # self.outputs["seman"] = self.seman_dispconv(features)
 
         return self.outputs
 
