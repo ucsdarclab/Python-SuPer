@@ -333,6 +333,8 @@ class SuPerDataset(GeneralDataset):
 
                 semantic_conf = F.one_hot(semantic_label[0]).permute(2, 0, 1).double()
 
+                # TODO: Add the augmentation code.
+
                 return semantic_conf, semantic_label
         else:
             return None
