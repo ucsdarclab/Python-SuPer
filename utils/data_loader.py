@@ -245,13 +245,21 @@ class SuPerDataset(GeneralDataset):
     def get_files(self):
         rgb_dir = "rgb"
         depth_dir = "depth"
-        seg_dir = "seg/DeepLabV3+"
+        seg_dir = self.opt.data_seg_dir
 
         frames = []
         if self.phase == 'train':
             filelist = [file for file in os.listdir(os.path.join(self.opt.data_dir, rgb_dir)) \
                         if file.endswith(f"left{self.img_ext}")]
         else:
+            if self.end_id is None:
+                self.end_id = 0
+                for filename in os.listdir(os.path.join(self.opt.data_dir, rgb_dir)):
+                    if filename.endswith(self.img_ext):
+                        id_temp = int(filename.split('-')[0])
+                        if id_temp > self.end_id:
+                            self.end_id = id_temp
+                self.end_id += 1
             filelist = ["{:06d}-left{}".format(id,self.img_ext) for id in range(self.start_id, self.end_id)]
         
         for file in filelist:
@@ -306,18 +314,26 @@ class SuPerDataset(GeneralDataset):
         semantic_path = files[file_id]
         
         if os.path.exists(semantic_path):
-            semantic_conf = np.load(semantic_path).astype(np.float32)
-            semantic_label = np.argmax(semantic_conf, axis=0, keepdims=True)
-            semantic_label = torch.as_tensor(semantic_label, dtype=torch.long)
+            if semantic_path.endswith('.npy'):
+                semantic_conf = np.load(semantic_path).astype(np.float32)
+                semantic_label = np.argmax(semantic_conf, axis=0, keepdims=True)
+                semantic_label = torch.as_tensor(semantic_label, dtype=torch.long)
 
-            if do_flip:
-                semantic_label = T.functional.hflip(semantic_label)
+                if do_flip:
+                    semantic_label = T.functional.hflip(semantic_label)
 
-            if do_vertical_flip:
-                semantic_label = T.functional.vflip(semantic_label)
-                
-            return semantic_conf, semantic_label
-        
+                if do_vertical_flip:
+                    semantic_label = T.functional.vflip(semantic_label)
+                    
+                return semantic_conf, semantic_label
+
+            elif semantic_path.endswith('.png'):
+                semantic_label = T.ToTensor()(Image.open(semantic_path)) * 255.
+                semantic_label = semantic_label.long()
+
+                semantic_conf = F.one_hot(semantic_label[0]).permute(2, 0, 1).double()
+
+                return semantic_conf, semantic_label
         else:
             return None
 
@@ -513,6 +529,7 @@ def depth_preprocessing(opt, models, inputs):
         norms = norms[0].type(torch.float64)
         if ("seg", 0) in inputs:
             seg = inputs[("seg", 0)][0, 0]
+        if ("seg_conf", 0) in inputs:
             seg_conf = inputs[("seg_conf", 0)][0].permute(1, 2, 0)
         valid = valid[0]
 
@@ -565,6 +582,7 @@ def depth_preprocessing(opt, models, inputs):
     
     if ("seg", 0) in inputs:
         data.seg = seg[valid_verts]
+    if ("seg_conf", 0) in inputs:
         data.seg_conf = seg_conf[valid_verts]
 
         # Calculate the (normalized) distance of project points to the semantic region edges.
