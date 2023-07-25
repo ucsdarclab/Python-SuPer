@@ -49,10 +49,12 @@ def main():
                         type=int, 
                         default=0)
     parser.add_argument('--end_id', 
-                        type=int, 
-                        default=520)
+                        type=int)
     parser.add_argument('--data_dir', 
                         required=True)
+    parser.add_argument('--data_seg_dir', 
+                        help='path to segmentation data under data_dir',
+                        default='seg/DeepLabV3+')
     parser.add_argument('--tracking_gt_file', 
                         dest='tracking_gt_file')
     parser.add_argument('--height', 
