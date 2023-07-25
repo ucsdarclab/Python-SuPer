@@ -245,7 +245,7 @@ class SuPerDataset(GeneralDataset):
     def get_files(self):
         rgb_dir = "rgb"
         depth_dir = "depth"
-        seg_dir = self.opt.data_seg_dir #"seg" # "seg/DeepLabV3+"
+        seg_dir = self.opt.data_seg_dir
 
         frames = []
         if self.phase == 'train':
