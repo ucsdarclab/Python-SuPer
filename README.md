@@ -45,6 +45,9 @@ python main.py --method semantic-super --mod_id 1 --exp_id 1 \
 * We use the [Segmentation Models Pytorch (SMP) package](https://github.com/qubvel/segmentation_models.pytorch) for semantic segmentation.
 * ```--sf_soft_seg_point_plane```: Semantic-aware point-to-plane ICP loss $\mathcal{L}_{icp}$, ```--render_loss```: Rendering loss $\mathcal{L}_{render}$, ```--sf_bn_morph```: Semantic-aware morphing loss $\mathcal{L}_{morph}$, ```--mesh_face```: Face loss $\mathcal{L}_{face}$.
 
+Ensure that you have the desired segmentation masks ready. You may produce them by modifying and running seg/inference.sh, using the pretrained checkpoints [here](https://drive.google.com/drive/folders/1qzv0KKo_t0VfVQkeNvbeB--4klCDXKiU?usp=sharing)
+Alternatively, you may train new checkpoints using the ground truths in the folders above and the seg/train.sh script.
+
 ## Tune the model.
 The tracking performance is influenced by several parameters:
 1. ```--mesh_step_size```: Grid step size to initialize the ED graph. ```--num_neighbors```, ```--num_ED_neighbors```: Number of neighboring surfels and ED nodes.
