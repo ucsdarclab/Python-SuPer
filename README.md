@@ -50,6 +50,7 @@ Notes:
 * We also provide another deep learning depth estimation model [RAFT-Stereo](https://github.com/princeton-vl/RAFT-Stereo). To use it, replace ```--load_depth``` with ```--depth_model raft_stereo --pretrained_depth_checkpoint_dir ./depth/raft_core/weights/raft-pretrained.pth --dilate_invalid_kernel 50```.
 * ```--sf_point_plane```: Point-to-plane ICP loss, ```--mesh_rot```: Rot loss, ```--mesh_arap```: As-rigid-as-possible loss.
 * If ```--use_derived_gradient``` is set, the quaternions & translations will be optimized with Levenberg-Marquardt Algorithm and derived gradient, while if ```--use_derived_gradient``` is not used, the quaternions & translations will be optimized with Adam optimizer and PyTorch autograd.
+* Use tensorboard to see tracking records, results, and visualizations.
 
 ### Semantic-SuPer:
   - Run Semantic-SuPer:
@@ -165,9 +166,8 @@ Notes:
 * We use the [Segmentation Models Pytorch (SMP) package](https://github.com/qubvel/segmentation_models.pytorch) to get semantic segmentation masks. ```--load_seg``` is called to load the precomputed semantic segmentation maps.
 * ```--num_classes``` is the number of semantic classes, the Semantic-SuPer data has three classes: chicken, beef, and surgical tool.
 * ```--sf_soft_seg_point_plane```: Semantic-aware point-to-plane ICP loss, ```--mesh_face```: Face loss, ```--sf_bn_morph```: Semantic-aware morphing loss, ```--render_loss``` (not in-use for now): Rendering loss.
-
-Ensure that you have the desired segmentation masks ready. You may produce them by modifying and running seg/inference.sh, using the pretrained checkpoints [here](https://drive.google.com/drive/folders/1qzv0KKo_t0VfVQkeNvbeB--4klCDXKiU?usp=sharing).
-Alternatively, you may train new checkpoints using the ground truths in the folders above and the seg/train.sh script.
+* Ensure that you have the desired segmentation masks ready. You may produce them by modifying and running seg/inference.sh, using the pretrained checkpoints [here](https://drive.google.com/drive/folders/1qzv0KKo_t0VfVQkeNvbeB--4klCDXKiU?usp=sharing). Alternatively, you may train new checkpoints using the ground truths in the folders above and the seg/train.sh script.
+* Use tensorboard to see tracking records, results, and visualizations.
 
 ## Tune the model.
 The tracking performance can be influenced by:
