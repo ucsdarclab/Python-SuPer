@@ -170,10 +170,11 @@ Ensure that you have the desired segmentation masks ready. You may produce them 
 Alternatively, you may train new checkpoints using the ground truths in the folders above and the seg/train.sh script.
 
 ## Tune the model.
-The tracking performance is influenced by several parameters:
-1. ```--mesh_step_size```: Grid step size to initialize the ED graph. ```--num_neighbors```, ```--num_ED_neighbors```: Number of neighboring surfels and ED nodes.
-2. ```--th_dist```, ```--th_cosine_ang```: Thresholds to decide if two surfels could be merged.
-3. ```--?_weight```: Weights for the losses.
+The tracking performance can be influenced by:
+1. Quality of input data (e.g., the depth map).
+2. ```--mesh_step_size```: Grid step size to initialize the ED graph. ```--num_neighbors```, ```--num_ED_neighbors```: Number of neighboring surfels and ED nodes.
+3. ```--th_dist```, ```--th_cosine_ang```: Thresholds to decide if two surfels could be merged.
+4. ```--?_weight```: Weights for the losses.
 
 ## Results
 * Reprojection errors:
@@ -181,22 +182,21 @@ The tracking performance is influenced by several parameters:
 
   |model|commit id|[depth model] <br> Fine-tuned Mono2|[depth model] <br> pre-trained <br> RAFT-S|reproj. error <br> mean(std)|
   |---  |---  |---  |---  |---  |
-  |super|6740231|:heavy_check_mark:|-|9.176(13.06)|
-  |super|f9e050d|:heavy_check_mark:|-|8.893(12.96)|
-  |super|6740231|-|:heavy_check_mark:|11.58(16.1)|
+  |super|8a5091c|:heavy_check_mark:|-|9.2(13.2)|
+  |super|8a5091c|-|:heavy_check_mark:|11.5(16.3)|
 
   - Semantic SuPer Data:
 
   |model|commit id|[depth model] <br> Fine-tuned Mono2|[depth model] <br> pre-trained <br> RAFT-S|[data] <br> Trial1|[data] <br> Trial2|[data] <br> Trial3|[data] <br> Trial4|reproj. error <br> mean(std) <br> all pts, edge pts |
   |---  |---  |---  |---  |---  |---  |---  |---  |---  |
-  |super|6740231|:heavy_check_mark:|-|:heavy_check_mark:|-|-|-|9.19, 11.86|
-  |semantic-super|0ce7100|:heavy_check_mark:|-|:heavy_check_mark:|-|-|-|?, ?|
-  |super|6740231|:heavy_check_mark:|-|-|:heavy_check_mark:|-|-|8.62, 9.272|
-  |semantic-super|0ce7100|:heavy_check_mark:|-|-|:heavy_check_mark:|-|-|?, ?|
-  |super|6740231|:heavy_check_mark:|-|-|-|:heavy_check_mark:|-|6.745, 7.331|
-  |semantic-super|0ce7100|:heavy_check_mark:|-|-|-|:heavy_check_mark:|-|?, ?|
-  |super|6740231|:heavy_check_mark:|-|-|-|-|:heavy_check_mark:|4.427, 4.986|
-  |semantic-super|0ce7100|:heavy_check_mark:|-|-|-|-|:heavy_check_mark:|?, ?|
+  |super|8a5091c|:heavy_check_mark:|-|:heavy_check_mark:|-|-|-|8.9, 11.1|
+  |semantic-super|8a5091c|:heavy_check_mark:|-|:heavy_check_mark:|-|-|-|6.2, 6.5|
+  |super|8a5091c|:heavy_check_mark:|-|-|:heavy_check_mark:|-|-|9.1, 10.6|
+  |semantic-super|8a5091c|:heavy_check_mark:|-|-|:heavy_check_mark:|-|-|7.5, 8.6|
+  |super|8a5091c|:heavy_check_mark:|-|-|-|:heavy_check_mark:|-|6.7, 7.3|
+  |semantic-super|8a5091c|:heavy_check_mark:|-|-|-|:heavy_check_mark:|-|6.1, 6.6|
+  |super|8a5091c|:heavy_check_mark:|-|-|-|-|:heavy_check_mark:|4.4, 5.2|
+  |semantic-super|8a5091c|:heavy_check_mark:|-|-|-|-|:heavy_check_mark:|4.3, 5.0|
 
 ## Documentation
 The documentation of the code is available [here](https://docs.google.com/document/d/1goWAr8oYvFmYdtoZNrDrbGh4bU2chzOkBxqeONUnIgc/edit?usp=sharing).
