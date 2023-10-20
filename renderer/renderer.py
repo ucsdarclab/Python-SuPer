@@ -47,23 +47,15 @@ class Pulsar(nn.Module):
         ], dtype=torch.float32).cuda()
         return cam_params
 
-    def forward(self, inputs, data, colors=None, view_scale=1.0, rad=0.01, bg_col=torch.tensor([0.0, 0.0, 0.0]).cuda()):
-
-        if colors is None:
-            colors = data.colors
-        points = data.points
-        surfel_num = len(points)
+    def forward(self, inputs, data, colors=None, view_scale=1.0, rad=0.01, bg_col=torch.tensor([0.0, 0.0, 0.0])):
         
-        # Points
-        vert_pos = points.type(torch.float32)
-
-        # Colors
-        vert_col = colors.type(torch.float32)
-
-        # Radii of points
-        vert_rad = torch.ones(surfel_num, dtype=torch.float32).cuda() * rad
+        if colors is None: colors = data.colors    # (N, 3)
+        points = data.points; surfel_num = len(points)
         
-        # Camera params
+        vert_pos = points.type(torch.float32) # Points
+        vert_col = colors.type(torch.float32) # Colors
+        vert_rad = torch.ones(surfel_num, dtype=torch.float32).cuda() * rad  # Radii of points
+        
         cam_params = self.get_cam_params(inputs, view_scale)
 
         # The volumetric optimization works better with a higher number of tracked
@@ -73,7 +65,7 @@ class Pulsar(nn.Module):
             int(self.height * view_scale),
             surfel_num, n_track=64, right_handed_system=True
         ).cuda()
-
+        
         return renderer.forward(
             vert_pos,
             vert_col,
@@ -82,7 +74,7 @@ class Pulsar(nn.Module):
             self.gamma,
             15.0,
             return_forward_info=False,
-            bg_col=bg_col,
+            bg_col=bg_col.to(vert_pos.device),
         )
 
 
@@ -94,7 +86,7 @@ class Projector(nn.Module):
         self.method = method
 
     def forward(self, inputs, allModel, qual_color=False):
-
+        
         if self.method == "direct":
             y, x, _, valid_indices = pcd2depth(inputs, allModel.points, depth_sort=True)
             out = torch.zeros((inputs["height"], inputs["width"], 3)).cuda()

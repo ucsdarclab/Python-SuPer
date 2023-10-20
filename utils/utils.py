@@ -1,24 +1,27 @@
-import numpy as np
-import os
-import sys
-import shutil
-import logging
+""" Utilities for logging, visualization, evaluation """
+
+from tarfile import is_tarfile
+import os, io, sys, random, glob, shutil, logging, numpy as np, pandas as pd
 from typing import Any, BinaryIO, List, Optional, Tuple, Union
 from PIL import Image, ImageColor, ImageDraw, ImageFont
 
-import torch
-import torch.nn as nn
+import torch, torch.nn as nn, torch.nn.functional as F
+from torchvision.utils import make_grid
+import torchvision.transforms as T
+import torch.backends.cudnn as cudnn
 
-import torch.nn.functional as F
+
+import matplotlib.pyplot as plt
 
 from pytorch3d.ops import (
     ball_query,
     knn_points,
 )
+from pytorch3d.transforms import quaternion_to_matrix, matrix_to_quaternion
 
 def get_grid_coords(h, w, dtype=torch.long, batch_size=None, stack_dim=None):
     """
-    Get grids of x,y coordinates.
+    Get grids of coordinates from the 1D inputs.
     """
     u = torch.arange(w, dtype=dtype).cuda()
     v = torch.arange(h, dtype=dtype).cuda()
@@ -38,7 +41,7 @@ def draw_keypoints(
     keypoints: torch.Tensor,
     connectivity: Optional[List[Tuple[int, int]]] = None,
     colors: Optional[Union[str, Tuple[int, int, int]]] = None,
-    radius: int = 2,
+    radius: int = 3,
     width: int = 3,
 ) -> torch.Tensor:
 
@@ -59,19 +62,8 @@ def draw_keypoints(
         img (Tensor[C, H, W]): Image Tensor of dtype uint8 with keypoints drawn.
     """
 
-    # if not torch.jit.is_scripting() and not torch.jit.is_tracing():
-    #     _log_api_usage_once(draw_keypoints)
-    # if not isinstance(image, torch.Tensor):
-    #     raise TypeError(f"The image must be a tensor, got {type(image)}")
-    # elif image.dtype != torch.uint8:
-    #     raise ValueError(f"The image dtype must be uint8, got {image.dtype}")
-    # elif image.dim() != 3:
-    #     raise ValueError("Pass individual images, not batches")
-    # elif image.size()[0] != 3:
-    #     raise ValueError("Pass an RGB image. Other Image formats are not supported")
-
-    # if keypoints.ndim != 3:
-    #     raise ValueError("keypoints must be of shape (num_instances, K, 2)")
+    if keypoints.ndim != 3:
+        raise ValueError("keypoints must be of shape (num_instances, K, 2)")
 
     ndarr = image.permute(1, 2, 0).cpu().numpy()
     img_to_draw = Image.fromarray(ndarr)
@@ -148,19 +140,7 @@ def blur_image(imgs, method="pyt-gauss", kernel=15):
         else:
             return imgs
 
-def torch_to_numpy(inputs):
-    return inputs.detach().cpu().numpy()
-
-def numpy_to_torch(inputs, dtype=torch.float32, to_gpu=True):
-    if to_gpu:
-        return torch.as_tensor(inputs, dtype=dtype).cuda()
-    else:
-        return torch.as_tensor(inputs, dtype=dtype)
-
 def torch_inner_prod(a, b, dim=-1, keepdim=False):
-    """
-    Inner product.
-    """
     return torch.sum(a*b, dim=dim, keepdim=keepdim)
 
 def torch_distance(a,b,keepdim=False):
@@ -169,19 +149,6 @@ def torch_distance(a,b,keepdim=False):
 def torch_sq_distance(a, b, dim=-1, keepdim=False):
     return torch.pow(a - b, 2).sum(dim)
 
-def torch_resize(inputs, size, mode='bilinear'):
-    """
-    size: float or tuple(int, int, ...)
-    inputs: BxCxHxW
-    """
-    assert isinstance(size, float) or (isinstance(size, tuple) and isinstance(size[0], int)), \
-        "Size should be either a float or tuple of ints."
-    inputs = inputs.type(fl32_)
-    if isinstance(size, float):
-        return F.interpolate(inputs, scale_factor=size, mode=mode)
-    else:
-        return F.interpolate(inputs, size=size, mode=mode)
-
 def torch_dilate(inputs, kernel=10, dtype=torch.bool):
     B, C, H, W = inputs.size() 
     kernel_tensor = torch.ones((C, 1, kernel, kernel)).to(inputs.device)
@@ -189,54 +156,60 @@ def torch_dilate(inputs, kernel=10, dtype=torch.bool):
     outputs = (outputs > 0).type(dtype)
     return outputs
 
-# def torch_delete(inputs, indexs):
-#     mask = torch.ones(len(inputs), dtype=bool).cuda()
-#     mask[indexs] = False
-#     return inputs[mask]
 
-# # Reset contents in folder "foldername"
-# def reset_folder(foldername):
 
-#     if os.path.exists(foldername):
-#         shutil.rmtree(foldername)
-#     os.makedirs(foldername)
-
-# point cloud to coordinates on image plane (y*HEIGHT+x)
-# if vis_only==True, only keeps the points that are visable after projection
-# def pcd2depth(inputs, pcd, round_coords=True, conf_sort=False, conf=None, valid_margin=0):
 def pcd2depth(inputs, pcd, round_coords=True, valid_margin=0):
+    ''' point cloud to coordinates on image plane (y*HEIGHT+x) 
+        Note: A screen coordinate in `coord `is an int. For example:
+        ---------------------
+        | 0 | 1 | 2 | 3 | 4 | 
+        | 5 | 6 | 7 | 8 | 9 |
+        |10 |11 |12 |13 |14 |
+        ---------------------
+    '''
 
     height, width = inputs[("color",0)][0,0].size()
-
-    X = pcd[...,0]
-    Y = pcd[...,1]
-    Z = (pcd[...,2] + 1e-8)
+    X, Y, Z = pcd[...,0], pcd[...,1], (pcd[...,2] + 1e-8)
     
     u_ = X * inputs["K"][0,0,0] / Z + inputs["K"][0,0,2]
     v_ = Y * inputs["K"][0,1,1] / Z + inputs["K"][0,1,2]
-    u = torch.round(u_).long()
-    v = torch.round(v_).long()
+    u = torch.round(u_).long()      # (N,). Screen coordinate for each point
+    v = torch.round(v_).long()      # (N,). Screen coordinate for each point
+
     coords = v * width + u
     valid_proj = (v >= valid_margin) & (v < height-1-valid_margin) & \
-        (u >= valid_margin) & (u < width-1-valid_margin)
+        (u >= valid_margin) & (u < width-1-valid_margin)    # 
 
-    if round_coords:
-        return v, u, coords, valid_proj
-    else:
-        return v_, u_, coords, valid_proj
+    if round_coords:    return v, u, coords, valid_proj # (N,) 
+    else:               return v_, u_, coords, valid_proj
 
-# Convert depth map to point cloud.
 def depth2pcd(inputs, Z):
+    ''' Depth map to point cloud.
+    Input:  - inputs: Either a dict or torch tensor, encoding camera intrinsics K
+            - Z: Torch tensor. Depth map of shape (1, B, H, W)
+    Output: X, Y, Z
+    '''
 
+    assert Z.shape[0] == 1, f"Depth map should be of shape (1, B, H, W), but got {Z.shape}"
+    if not isinstance(inputs, torch.Tensor):
+        cx, cy, fx, fy = inputs['cx'], inputs['cy'], inputs['fx'], inputs['fy']
+    else:
+        assert inputs.squeeze().shape == (4,4), f'Camera intrinsic cannot be squeezed to (4, 4). The intrinsic matrix is of shape {inputs.shape}'
+        inputs = inputs.squeeze()
+        cx, cy, fx, fy = inputs[0,2], inputs[1,2], inputs[0,0], inputs[1,1]
+    
     Z = Z.squeeze(1)
     b, h, w = Z.size()
     u, v = get_grid_coords(h, w, batch_size=b)
-    
-    X = (u - inputs["cx"]) * Z / inputs["fx"]
-    Y = (v - inputs["cy"]) * Z / inputs["fy"]
-    return X.type(fl32_), Y.type(fl32_), Z
 
-def find_knn(points1, points2, num_classes=-1, seman1=None, seman2=None, k=20, radius=0.5, method="knn"):
+    X = (u - cx) * Z / fx
+    Y = (v - cy) * Z / fy
+    # return X.type(fl32_), Y.type(fl32_), Z
+    return X.to(torch.float32), Y.to(torch.float32), Z
+
+
+
+def find_knn(points1, points2, num_classes=-1, seg1=None, seg2=None, k=20, radius=0.5, method="knn"):
     def group_knn(p1, p2):
         if method == "ball_query":
             dists, idx, _ = ball_query(p1.unsqueeze(0), p2.unsqueeze(0), K=k, radius=radius)
@@ -250,13 +223,13 @@ def find_knn(points1, points2, num_classes=-1, seman1=None, seman2=None, k=20, r
         N1, N2 = len(points1), len(points2)
         points1_ids = torch.arange(N1)
         points2_ids = torch.arange(N2)
-        dists = 1e8 * torch.ones((N1, k), dtype=fl64_).cuda()
-        idx = - torch.ones((N1, k), dtype=long_).cuda()
+        dists = 1e8 * torch.ones((N1, k), dtype=torch.float64).cuda()
+        idx = - torch.ones((N1, k), dtype=torch.long).cuda()
         for class_id in range(num_classes):
-            val1 = seman1==class_id
+            val1 = seg1==class_id
             p1 = points1[val1]
 
-            val2 = (seman2==class_id).nonzero(as_tuple=True)[0]
+            val2 = (seg2==class_id).nonzero(as_tuple=True)[0]
             p2 = points2[val2]
 
             if len(p1) == 0 and len(p2) == 0:
@@ -267,14 +240,6 @@ def find_knn(points1, points2, num_classes=-1, seman1=None, seman2=None, k=20, r
             idx[val1] = val2[_idx_]
 
         return dists, idx
-
-# def write_args(filename, args):
-#     with open(filename, 'w') as f:
-#         for arg in vars(args):
-#             f.write(arg)
-#             f.write(':  ')
-#             f.write(str(getattr(args, arg)))
-#             f.write('\n')
 
 def KLD(P, Q, eps=1e-13, dim=-1):
     """
@@ -335,85 +300,231 @@ def find_edge_region(x, num_classes=0, class_list=None, kernel=11, ignore_img_ed
 
     return edge_mask
 
-class CustomLogManager:
-    '''
-    To use this, 
-    1. import the instance `custom_log_manager` in your main script and `setup`
-    2. import the instance `custom_log_manager` in any `.py` file you would like logging,
-    and `logger = custom_log_manager.get_logger(NAME, level=LEVEL)`, and use `logger.info`
-    or `logger.warn` to replace all `print` statements.
-    * do NOT setup your custom_log_manager more than once.
-    '''
-    def __init__(self):
-        self._loggers = []
-        self.file_handler = None
-        self.console_handler = None
-        pass
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
-    def setup(self, to_file: bool=False, log_prefix: str=None, time_stamp=None, logdir: str='logs'):
-        '''
-        Setup handlers depending on the given parameters. 
-        When `to_file==True` and `log_prefix==None`, a default prefix 'log' will be given.
-        `log_prefix` does not do anything when `to_file` is False.
-        `time_stamp` will be appended at the end of the file name if not None.
-        Examples:
-        ```
-        import datetime
-        from utils import custom_log_manager
-        time_stamp = datetime.datetime.now().strftime("%y-%m-%d--%H-%M-%S")
-        custom_log_manager.setup(to_file=True, time_stamp=time_stamp)
-        logger = custom_log_manager.get_logger('main')
-        ```
-        or
-        ```
-        custom_log_manager.setup(to_file=True, log_prefix=f'train_exp{mod_id}', time_stamp=time_stamp)
-        logger = custom_log_manager.get_logger('evaluate')
-        ```
-        '''
-        if to_file and log_prefix is None: 
-            log_prefix = 'log'
-        self.logdir = logdir
-        self.to_file = to_file
-        self.time_stamp = time_stamp
-        if self.to_file:
-            if self.time_stamp is not None:
-                log_fn = f"{log_prefix}-{self.time_stamp}.txt"
-            else:
-                log_fn = f"{log_prefix}.txt"
-        self.fmt = logging.Formatter(
-            fmt="%(asctime)s %(name)-12s %(levelname)-8s %(message)s",
-            datefmt="%m-%d %H:%M:%S")
-        if self.to_file:
-            os.makedirs(self.logdir, exist_ok=True)
-            log_full_fn = os.path.join(self.logdir, log_fn)
-            self.file_handler = logging.FileHandler(log_full_fn)
-            self.file_handler.setLevel(logging.DEBUG)
-            self.file_handler.setFormatter(self.fmt)
-        self.console_handler = logging.StreamHandler(sys.stdout)
-        self.console_handler.setLevel(logging.DEBUG)
-        self.console_handler.setFormatter(self.fmt)
+def conf2color(confs):
+    ''' Convert float-valued surfel confidence score to RGB color (for plotting heat map)'''
+    assert len(confs.shape) == 1, f'Point condfidences should be of shape (N,), but got {confs.shape}'
+    if torch.is_tensor(confs): confs = confs.cpu().numpy()
+    cmap = plt.get_cmap('magma')
+    colors = torch.as_tensor(cmap(confs))[:,:-1].cuda() # remove alpha
+    return colors
 
-        # Some loggers may have been added before setup in the main file.
-        for logger in self._loggers:
-            if self.console_handler is not None:
-                logger.addHandler(self.console_handler)
-            if self.file_handler is not None:
-                logger.addHandler(self.file_handler)
-            
+def png_to_gif(png_dir = "./", duration = 500):
+    ''' Find all png files in `png_dir`, aggregate them into a .gif file '''
+    frames = []
+    imgs = glob.glob(os.path.join(os.path.expanduser(png_dir), "*.png"))
+    for i in imgs:
+        new_frame = Image.open(i)
+        frames.append(new_frame)
+
+    frames[0].save('png_to_gif.gif', format='GIF', append_images=frames[1:], 
+                   save_all=True, duration=duration, loop=0)
+
+def plot_pcd(pcd, colors, filename=None, view_params=None):
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Plot the dense point cloud
+    ax.scatter(pcd[:, 0], 
+            pcd[:, 1], 
+            -pcd[:, 2], 
+            c=np.clip(colors,0,1), 
+            s=1)
+
+    if view_params is not None:
+        ax.view_init(elev=view_params[0], azim=view_params[1])
+
+    # Hide grid lines
+    ax.grid(False)
+    ax.axis('off')
+
+    # Hide axis numbers
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_zticks([])
+
+    if filename is None:
+        fig.canvas.draw()
+        pcd_image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        pcd_image = pcd_image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        
+        return pcd_image
     
-    def get_logger(self, name: str, level=logging.DEBUG):
-        '''
-        The `name` will be the second element in a log line. 
-        Usually used to identify which function/namespace/file/etc. is logging.
-        You can set it to any arbitrary string.
-        '''
-        logger = logging.getLogger(name)
-        logger.setLevel(level)
-        if self.console_handler is not None:
-            logger.addHandler(self.console_handler)
-        if self.file_handler is not None:
-            logger.addHandler(self.file_handler)
-        self._loggers.append(logger)
-        return logger
+    else:
+        fig.savefig(filename, bbox_inches='tight', pad_inches=0)
 
-custom_log_manager = CustomLogManager()
+def get_gt(args) -> tuple:
+    ''' Returns a list of all ground truth files
+    Input:  args parsed from argparser
+    Output: Tuple containing the following:
+        - gt_supercpp_surf: Dict of dicts. {
+            'gt':           {...}
+            'super_cpp':    {...}
+            'SURF':         {...}
+        }
+        - gt: dict. {
+            '000010': array of shape (20, 3). Homogeneous screen coord. of 20 tracked points at time 000010
+            '000020': array of shape (20, 3). Homogeneous screen coord. of 20 tracked points at time 000020
+            ...
+            '000520': array of shape (20, 3). Homogeneous screen coord. of 20 tracked points at time 000520
+        }
+        - gt_intkeys: [10, 20, ..., 520]
+        - gt_strkeys: ['000010', '000020', ..., '000520']
+        - gt_array: np array of shape (52, 20, 3). Homogeneous screen coord. of 20 tracked points at all times
+    ''' 
+    data_dir = os.path.expanduser(args.data_dir)
+    if not os.path.exists(data_dir): 
+        raise ValueError(f'Path {data_dir} does not exist. This is likely an error with args.data_dir configuration.')
+
+    gt_path = os.path.join(data_dir, args.tracking_gt_file)
+    if not os.path.exists(gt_path):
+        raise ValueError(f'Ground truth file does not exist!')
+
+    gt_supercpp_surf = np.array(np.load(gt_path, allow_pickle=True)).tolist()
+    gt = gt_supercpp_surf['gt']  # keys: 'gt', 'super_cpp', 'SURF'. 
+    gt_intkeys = sorted([int(k) for k in gt.keys()])                   # 04, 05, 06, ..., 10, ...
+    gt_strkeys = sorted([f"{int(k):06d}" for k in gt.keys()])
+    gt_array = np.stack([gt[k] for k in gt_strkeys], axis=0)
+    return gt_supercpp_surf, gt, gt_intkeys, gt_strkeys, gt_array
+
+def save_and_log_fig(fname, title, summary_writer, time):
+    ''' Save the plt figure and log to tensorboard 
+    Inputs:
+    - fname: str. Path to save the figure.
+    - title: str. Title of the figure.
+    - summary_writer: Tensorboard summary writer.
+    - time: int. Current time stamp.
+    '''
+    plt.savefig(fname, format='png'); plt.clf(); plt.close()
+    summary_writer.add_image(title, T.ToTensor()(plt.imread(fname, format='png')), global_step=time)
+    return
+
+def log_trackpts_err(err_array, res_array, edge_ids, gt_array, logdir, summary_writer, time):
+    ''' Log reprojection error of 20 tracked points across N time stamps.
+    Inputs:
+    - err_array: np array (N, 20). 
+    - res_array: np array (N, 20, 3). Predicted point locations in homogeneous screen coord. 
+    - gt_array: np array (N, 20, 3). Ground truth point locations in homogeneous screen coord.
+    - logdir: str. Path to log directory.
+    - summary_writer: Tensorboard summary writer.
+    - time: int. Current time stamp.
+
+    Produces 3 plots, all of which are logged to Tensorboard and saved to logdir:
+    - Plot 1: Bar plot of reprojection error stats for each point.
+    - Plot 2: Reprojection error of each point over each frame.
+    - Plot 3: 20 plots, predicted and ground truth point trajectories.
+
+    Also logs the following to Tensorboard:
+    - Mean reprojection error across all points and all time steps.
+    - Std dev of reprojection error across all points and all time steps.
+    '''
+    colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple', 
+        'tab:brown', 'tab:pink', 'tab:gray', 'tab:olive', 'tab:cyan',
+        'tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple', 
+        'tab:brown', 'tab:pink', 'tab:gray', 'tab:olive', 'tab:cyan']
+
+    ''' Draw plot 1: Bar plot of reprojection error stats for each point. '''
+    if not os.path.exists(logdir): os.makedirs(custom_log_manager.logdir)
+    fname = os.path.expanduser(f'{logdir}/reprojerr_avg0.png')
+    title = f'plots/Reprojection error of 20 tracked points averaged over all time steps'
+    valid = err_array >= 0       # (N, 20)
+    numpoints = err_array.shape[1]
+    std_ = np.array([np.std(err_array[:,i][valid[:,i]]) for i in range(numpoints)])
+    mean_ = np.array([np.mean(err_array[:,i][valid[:,i]]) for i in range(numpoints)])
+
+    plt.figure(figsize=(12,3)); bar_width = 0.25
+    plt.scatter(np.arange(numpoints), mean_, s=40, color=colors[1])
+    # plt.bar(np.arange(numpoints), mean_, bar_width, color=colors[1])  # Use bar plot if comparing different approaches
+    plt.errorbar(np.arange(numpoints), mean_, std_, linestyle='None', color='k', elinewidth=.8, capsize=3)
+    plt.xticks(np.arange(numpoints), np.arange(numpoints)+1)
+    plt.xlabel('Tracked point ID'); plt.ylabel('Error (unit: pixel)')
+    plt.grid(True); plt.title(title)
+    save_and_log_fig(fname, title, summary_writer, time)
+
+
+    ''' Draw plot 2: Reprojection error of each point over time. '''
+    fname = os.path.expanduser(f'{logdir}/reprojerr_avg1.png')
+    title = f'plots/Average reprojection error of 20 tracked points across all time steps'
+    x = np.arange(err_array.shape[0])
+    plt.figure(figsize=(24,6)); window_size = 5
+    time_error = np.average(err_array, axis=1)  # (N,). Avg. error over all points for each time step.
+    y = pd.Series(time_error) if len(x) < window_size else pd.Series(time_error).rolling(window_size).mean().tolist()
+    plt.plot(x, time_error, '.', color=colors[0], linewidth=0.8)
+    plt.plot(x, y, color=colors[0], linewidth=0.8)
+    plt.xticks(x, (x+1)*10)
+    plt.xlabel('Time step'); plt.ylabel('Error (unit: pixel)')
+    plt.grid(True); plt.title(title)
+    save_and_log_fig(fname, title, summary_writer, time)
+
+    ''' Draw plot 3: predicted and ground truth point trajectories. '''
+    fname = os.path.expanduser(f'{logdir}/reprojerr_trajectory.png')
+    title = f'plots/Trajectory of 20 tracked points across all time steps'
+    tensor_imgs = []
+    for i in range(numpoints):
+        plt.figure(figsize=(4,4))
+
+        x_gt, y_gt = gt_array[:,i,0], gt_array[:,i,1]
+        valid = (x_gt > 0) & (y_gt > 0)
+        x_gt, y_gt = x_gt[valid], y_gt[valid]
+        plt.plot(x_gt, y_gt, color=colors[0], label='Ground Truth')
+
+        x_res, y_res = res_array[:,i,0], res_array[:,i,1]
+        valid = (x_res > 0) & (y_res > 0)
+        x_res, y_res = x_res[valid], y_res[valid]
+        plt.plot(x_res, y_res, color=colors[1], label='Predicted'); plt.legend(loc='upper right'); 
+        
+        xmin, xmax = np.min(np.concatenate([x_gt, x_res])), np.max(np.concatenate([x_gt, x_res]))
+        ymin, ymax = np.min(np.concatenate([y_gt, y_res])), np.max(np.concatenate([y_gt, y_res]))
+
+        xtics, ytics = np.arange(xmin-10, xmax+10)[::20], np.arange(ymin-10, ymax+10)[::20]
+        plt.xticks(xtics, [round(t) for t in xtics], rotation=60)
+        plt.yticks(ytics, [round(t) for t in ytics])
+        plt.grid(True, linestyle='--', linewidth=0.5, alpha=0.5); 
+        plt.title(f'point {i+1}')
+        
+        buf = io.BytesIO(); plt.savefig(buf, format='png'); buf.seek(0)
+        tensor_imgs.append(T.ToTensor()(Image.open(buf))); 
+        buf.close(); plt.clf(); plt.close()
+    
+    plt.figure(figsize=(30,24)); plt.box(False); plt.title(title, fontsize=24)
+    plt.imshow(make_grid(tensor_imgs, nrow=5).permute(1,2,0).numpy())
+    plt.xticks([]); plt.yticks([])
+    plt.xlabel('x (unit: pixel)', fontsize=24); plt.ylabel('y (unit: pixel)',fontsize=24)
+    save_and_log_fig(fname, title, summary_writer, time)
+
+    summary_writer.add_scalar('reprojerr/pythonsuper_mean', np.mean(err_array), time)
+    summary_writer.add_scalar('reprojerr/pythonsuper_std', np.std(err_array), time)
+
+    if len(edge_ids) > 0:
+        select = np.zeros(err_array.shape[1], dtype=np.bool)
+        select[np.array(edge_ids) - 1] = True
+        
+        summary_writer.add_scalar('reprojerr/pythonsuper_edge_pts_mean', 
+                                  np.mean(err_array[:, select]), 
+                                  time)
+        summary_writer.add_scalar('reprojerr/pythonsuper_edge_pts_std', 
+                                  np.std(err_array[:, select]), 
+                                  time)
+
+    return
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    cudnn.benchmark = False
+
+def merge_transformation(q1, q2):
+    R1 = quaternion_to_matrix(q1[:, 0:4])
+    R2 = quaternion_to_matrix(q2[:, 0:4])
+    R = torch.matmul(R2, R1)
+    q = matrix_to_quaternion(R)
+
+    t = q2[:, 4:] + torch.matmul(R2, q1[:, 4:][:, :, None])[:, :, 0]
+
+    return torch.concat([q, t], dim=1)

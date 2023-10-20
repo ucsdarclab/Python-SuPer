@@ -32,6 +32,11 @@ dependencies:
   - scipy
   # =1.9.0=py38hea3f02b_0
   - torchvision=0.12.0=py38_cu113
+  - filterpy  # kalman filter
+  - cupy
+  - tensorboard
+  - opt_einsum
+  - pillow=9.4.0
   - pip:
     - kornia
     # ==0.6.6

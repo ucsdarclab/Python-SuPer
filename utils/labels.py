@@ -7,6 +7,8 @@ from __future__ import print_function, absolute_import, division
 from collections import namedtuple
 import numpy as np
 
+import torch
+
 #--------------------------------------------------------------------------------
 # Definitions
 #--------------------------------------------------------------------------------
@@ -35,10 +37,10 @@ Label = namedtuple( 'Label' , [
 #--------------------------------------------------------------------------------
 
 labels = [
-    #       name                     id    category          color(BGR)
-    Label(  'Beef'                  ,  0 ,  'background'     , (128,114,250) ),
-    Label(  'Chicken'               ,  1 ,  'background'     , (  0,215,255) ),
-    Label(  'Tool'                  ,  2 ,  'instrument'     , ( 50,205, 50) ),
+    #       name                     id    category          color(RGB)
+    Label(  'Beef'                  ,  0 ,  'background'     , (  0,  0,  0) ),
+    Label(  'Chicken'               ,  1 ,  'background'     , ( 50, 50, 50) ),
+    Label(  'Tool'                  ,  2 ,  'instrument'     , (150,150,150) ),
 ]
 
 
@@ -46,8 +48,10 @@ labels = [
 # Create dictionaries for a fast lookup
 #--------------------------------------------------------------------------------
 
-id2color        = np.zeros((3,3))
+id2color        = torch.zeros((3,3))
 for label in labels:
     id = label.id
     if id >= 0:
-        id2color[id] = np.array(label.color)
+        id2color[id] = torch.tensor(label.color)
+
+binary_id2color = torch.tensor([[50, 50, 50], [255, 255, 255]], dtype=torch.uint8)

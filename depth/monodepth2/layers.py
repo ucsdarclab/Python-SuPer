@@ -137,8 +137,7 @@ class Conv3x3(nn.Module):
 
 
 class BackprojectDepth(nn.Module):
-    """Layer to transform a depth image into a point cloud
-    """
+    """ Layer to transform a depth image into a point cloud """
     def __init__(self, batch_size, height, width):
         super(BackprojectDepth, self).__init__()
 
@@ -156,13 +155,13 @@ class BackprojectDepth(nn.Module):
 
         self.pix_coords = torch.unsqueeze(torch.stack(
             [self.id_coords[0].view(-1), self.id_coords[1].view(-1)], 0), 0)
-        self.pix_coords = self.pix_coords.repeat(batch_size, 1, 1)
+        self.pix_coords = self.pix_coords.repeat(batch_size, 1, 1) # (1, 2, H*W)
         self.pix_coords = nn.Parameter(torch.cat([self.pix_coords, self.ones], 1),
-                                       requires_grad=False)
+                                       requires_grad=False)     # (1, 3, H*W)
 
     def forward(self, depth, inv_K):
-        cam_points = torch.matmul(inv_K[:, :3, :3], self.pix_coords)
-        cam_points = depth.view(self.batch_size, 1, -1) * cam_points
+        cam_points = torch.matmul(inv_K[:, :3, :3], self.pix_coords) # (1,3,H*W)
+        cam_points = depth.view(self.batch_size, 1, -1) * cam_points # (1,1,H*W) * (1,3,H*W) -> (1,3,H*W)
         cam_points = torch.cat([cam_points, self.ones], 1)
 
         return cam_points
@@ -215,32 +214,18 @@ def get_smooth_loss(disp, img):
     return grad_disp_x.mean() + grad_disp_y.mean()
 
 
-def compute_reprojection_loss(pred, target):
-    """Computes reprojection loss between a batch of predicted and target images
-    """
-    abs_diff = torch.abs(target - pred)
-    l1_loss = abs_diff.mean(1, True)
-
-    ssim = SSIM().cuda()
-    ssim_loss = ssim(pred, target).mean(1, True)
-
-    reprojection_loss = 0.85 * ssim_loss + 0.15 * l1_loss
-
-    return reprojection_loss
-
-
 class SSIM(nn.Module):
     """Layer to compute the SSIM loss between a pair of images
     """
-    def __init__(self):
+    def __init__(self, kernel=3):
         super(SSIM, self).__init__()
-        self.mu_x_pool   = nn.AvgPool2d(3, 1)
-        self.mu_y_pool   = nn.AvgPool2d(3, 1)
-        self.sig_x_pool  = nn.AvgPool2d(3, 1)
-        self.sig_y_pool  = nn.AvgPool2d(3, 1)
-        self.sig_xy_pool = nn.AvgPool2d(3, 1)
+        self.mu_x_pool   = nn.AvgPool2d(kernel, 1)
+        self.mu_y_pool   = nn.AvgPool2d(kernel, 1)
+        self.sig_x_pool  = nn.AvgPool2d(kernel, 1)
+        self.sig_y_pool  = nn.AvgPool2d(kernel, 1)
+        self.sig_xy_pool = nn.AvgPool2d(kernel, 1)
 
-        self.refl = nn.ReflectionPad2d(1)
+        self.refl = nn.ReflectionPad2d(kernel//2)
 
         self.C1 = 0.01 ** 2
         self.C2 = 0.03 ** 2
@@ -260,39 +245,6 @@ class SSIM(nn.Module):
         SSIM_d = (mu_x ** 2 + mu_y ** 2 + self.C1) * (sigma_x + sigma_y + self.C2)
 
         return torch.clamp((1 - SSIM_n / SSIM_d) / 2, 0, 1)
-
-
-class AdaSSIM(nn.Module):
-    """Layer to compute the SSIM between a pair of windows
-    """
-    def __init__(self):
-        super(AdaSSIM, self).__init__()
-        self.mu_x_pool   = nn.AdaptiveAvgPool2d((1, 1))
-        self.mu_y_pool   = nn.AdaptiveAvgPool2d((1, 1))
-        self.sig_x_pool  = nn.AdaptiveAvgPool2d((1, 1))
-        self.sig_y_pool  = nn.AdaptiveAvgPool2d((1, 1))
-        self.sig_xy_pool = nn.AdaptiveAvgPool2d((1, 1))
-
-        self.refl = nn.ReflectionPad2d(1)
-
-        self.C1 = 0.01 ** 2
-        self.C2 = 0.03 ** 2
-
-    def forward(self, x, y):
-        x = self.refl(x)
-        y = self.refl(y)
-
-        mu_x = self.mu_x_pool(x)
-        mu_y = self.mu_y_pool(y)
-
-        sigma_x  = self.sig_x_pool(x ** 2) - mu_x ** 2
-        sigma_y  = self.sig_y_pool(y ** 2) - mu_y ** 2
-        sigma_xy = self.sig_xy_pool(x * y) - mu_x * mu_y
-
-        SSIM_n = (2 * mu_x * mu_y + self.C1) * (2 * sigma_xy + self.C2)
-        SSIM_d = (mu_x ** 2 + mu_y ** 2 + self.C1) * (sigma_x + sigma_y + self.C2)
-
-        return SSIM_n / SSIM_d
 
         
 def compute_depth_errors(gt, pred):

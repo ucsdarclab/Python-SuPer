@@ -1,10 +1,8 @@
-from abc import ABC, abstractmethod
-
 import torch
 device = torch.device("cpu" if not torch.cuda.is_available() else "cuda")
 import torch.nn.functional as F
 
-from utils.utils import pcd2depth
+from utils.utils import pcd2depth, torch_inner_prod, torch_sq_distance, JSD
 from super.utils import *
 
 # Bilinear sampling for autograd
@@ -46,7 +44,6 @@ def bilinear_sample(inputs, v, u, index_map=None, fill='zero', grad=False, norma
     
     # U_nm: (in_size,4,cat_input_channel,)
     if index_map is None:
-        # U_nm = features[n_block.long()*WIDTH+m_block.long()]
         U_nm = features[n_block.long(), m_block.long()]
     else:
         if fill == 'zero':
@@ -118,8 +115,17 @@ class LossTool():
             U_nm = target_[n_block.long()*WIDTH+m_block.long()]
         else:
             U_nm = torch.ones(n_block.size()+(target_.size()[-1],), dtype=torch.float64).cuda() * float('nan')
-            U_nm_index_map = index_map[n_block.long(), m_block.long()]
-            U_nm_valid = U_nm_index_map>=0
+            
+            h, w = index_map.size()
+            U_nm_index_map = index_map[torch.minimum(torch.maximum(n_block.long(), 
+                                                                    torch.tensor(0).cuda()),
+                                                    torch.tensor(h-1).cuda()), 
+                                       torch.minimum(torch.maximum(m_block.long(), 
+                                                                    torch.tensor(0).cuda()),
+                                                    torch.tensor(w-1).cuda())
+                                       ].cuda()
+            U_nm_valid = (U_nm_index_map>=0) & (n_block.long()>=0) & (n_block.long()<h) & (m_block.long()>=0) & (m_block.long()<w)
+
             U_nm[U_nm_valid] = target_[U_nm_index_map[U_nm_valid]]
         n_block -= v.unsqueeze(1)
         m_block -= u.unsqueeze(1)
@@ -214,14 +220,18 @@ class DataLoss(): # Loss
         self.skew_v = get_skew(self.sf_diff)
 
     def forward(self, lambda_, beta, inputs, new_data, grad=False, dldT_only=False):
-
         ### Find correspondence for ICP based on 3D-to-2D projection. Jacobian_elements: Nx4x3x4.
         trans_points, Jacobian_elements = Trans_points(self.sf_diff, self.sf_knn, \
             beta[self.sf_knn_indices], self.sf_knn_w, grad=grad, skew_v=self.skew_v)
         ## Project the updated points to the image plane.
         ## Only keep valid projections with valid new points.
         v, u, proj_coords, proj_valid_index = pcd2depth(inputs, trans_points, round_coords=False)
-        valid_pair = new_data.valid[proj_coords] # Valid proj-new pairs.
+        valid_pair = new_data.valid[torch.minimum(torch.maximum(
+                                                    proj_coords,
+                                                    torch.tensor(0).cuda()
+                                                ),
+                                                torch.tensor(len(new_data.valid)-1).cuda())] # Valid proj-new pairs.
+        valid_pair &= (proj_coords >= 0) & (proj_coords < len(new_data.valid))
         v, u = v[valid_pair], u[valid_pair]
         ## Find matched points & normal values, and calculate related grad if needed.
         new_points, dpdPi = LossTool.bilinear_intrpl_block(v, u,
@@ -283,91 +293,39 @@ class DataLoss(): # Loss
     def autograd_forward(opt, inputs, src, trg, 
     correspts=None, correspts_valid=None,
     flow=None, 
-    loss_type='point-plane', reduction='mean', square_loss=True, output_ids=None,
-    huber_th=-1, max_losses=None, min_losses=None, 
+    loss_type='point-plane', 
+    max=None,
+    huber_th=-1,
     src_seg=None, src_seg_conf=None, soft_seg=None):
         
         if correspts is not None:
             valid_idx = correspts_valid
             u = correspts[0][valid_idx]
             v = correspts[1][valid_idx]
-
-            # import cv2
-            # ed_v, ed_u, _, _ = pcd2depth(inputs, src.points, round_coords=False)
-            # img = 255 * torch_to_numpy(inputs[("color", 0, 0)][0].permute(1,2,0))[...,::-1]
-            # img = img.astype(np.uint8).copy()
-            # colors = [(255,0,0),
-            #           (0,255,0),
-            #           (0,0,255)]
-            # ed_colors = [(150,0,0),
-            #              (0,150,0),
-            #              (0,0,150)]
-            # for _u_, _v_, _ed_u_, _ed_v_, class_id in zip(u, v, ed_u[valid_idx], ed_v[valid_idx], src_seman[valid_idx]):
-            #     img = cv2.rectangle(img, 
-            #         (int(_u_ - 5), int(_v_ - 5)), (int(_u_ + 5), int(_v_ + 5)),
-            #         colors[class_id], -1)
-
-            #     img = cv2.arrowedLine(img, 
-            #         (int(_ed_u_+0.3*(_u_-_ed_u_)), int(_ed_v_+0.3*(_v_-_ed_v_))), 
-            #         (int(_ed_u_+0.6*(_u_-_ed_u_)), int(_ed_v_+0.6*(_v_-_ed_v_))),
-            #         colors[class_id], 1)
-
-            #     img = cv2.circle(img, (int(_ed_u_), int(_ed_v_)), 4, (255, 255, 255), -1)
-            #     img = cv2.circle(img, (int(_ed_u_), int(_ed_v_)), 3, ed_colors[class_id], -1)
-
-            # for _u_, _v_, class_id, knn_id in zip(ed_u[~valid_idx], ed_v[~valid_idx], src_seman[~valid_idx], src.knn_indices[~valid_idx]):
-            #     img = cv2.circle(img, (int(_u_), int(_v_)), 4, ed_colors[class_id], -1)
-
-            # #     # if class_id == 2:
-            # #     #     for _knn_id_ in knn_id:
-            # #     #         img = img.astype(np.uint8).copy()
-            # #     #         img = cv2.line(img, 
-            # #     #             (int(_u_.item()), int(_v_.item())), 
-            # #     #             (int(ed_u[_knn_id_].item()), int(ed_v[_knn_id_].item())), 
-            # #     #             (255, 255, 255), 1)
-
-            # cv2.imwrite("bnmorph.jpg", img)
-            
         else:
-            v_, u_, _, valid_idx = pcd2depth(inputs, src.points, round_coords=False, valid_margin=1)
+            v_, u_, _, valid_idx = pcd2depth(inputs, 
+                                             src.points, 
+                                             round_coords=False, 
+                                             valid_margin=1)
             u = u_[valid_idx]
             v = v_[valid_idx]
 
         if flow is not None:
             assert correspts is None
 
-            if isinstance(flow, tuple):
-                matches1, matches2 = flow
-                if len(matches1) == 0:
-                    return 0
+            grid = torch.stack([u_ * 2 / opt.width - 1, 
+                                v_ * 2 / opt.height - 1
+                               ], dim=1).view(1, -1, 1, 2).float()
+            trg_loc = F.grid_sample(flow, grid)[0,:,:,0]
+            u_ += trg_loc[0]
+            v_ += trg_loc[1]
 
-                v, u = matches2[:, 1], matches2[:, 0]
+            valid_margin = 1
+            valid_idx = (v_ >= valid_margin) & (v_ < opt.height - 1 - valid_margin) & \
+                        (u_ >= valid_margin) & (u_ < opt.width - 1 - valid_margin)
 
-                src_index_map = - torch.ones((inputs["height"], inputs["width"]), dtype=long_)
-                src_index_map[v_[valid_idx].type(long_), u_[valid_idx].type(long_)] = torch.arange(len(v_))[valid_idx]
-                src_indexs = src_index_map[matches1[:, 1].type(long_), matches1[:, 0].type(long_)]
-                sample_src_verts = src.points[src_indexs]
-                # sample_src_norms = src.norms[src_indexs]
-                src_sample_valid = src_indexs >= 0
-                # sample_src, _, src_sample_valid = bilinear_sample([src.points], 
-                #     matches1[:, 1], matches1[:, 0], index_map=src_index_map)
-                # sample_src, _, src_sample_valid = bilinear_sample([trg.points], 
-                #     matches1[:, 1]+0.1, matches1[:, 0]+0.1, index_map=trg.index_map)
-                # sample_src_verts = sample_src[0]
-            else:
-                grid = torch.stack(
-                    [u_ * 2 / inputs["width"] - 1, 
-                    v_ * 2 / inputs["height"] - 1], dim=1).view(1, -1, 1, 2).type(fl32_)
-                trg_loc = F.grid_sample(flow, grid)[0,:,:,0]
-                u_ += trg_loc[0]
-                v_ += trg_loc[1]
-
-                valid_margin = 1
-                valid_idx = (v_ >= valid_margin) & (v_ < inputs["height"]-1-valid_margin) & \
-                    (u_ >= valid_margin) & (u_ < inputs["width"]-1-valid_margin)
-
-                u = u_[valid_idx]
-                v = v_[valid_idx]
+            u = u_[valid_idx]
+            v = v_[valid_idx]
         
         if loss_type == 'point-point':
             if src_seg is not None:
@@ -382,59 +340,33 @@ class DataLoss(): # Loss
                     v, u, index_map=trg.index_map)
             sample_trg_verts = sample_trg[0]
             
-            if 'sample_src_verts' in locals():
-                sample_valid = sample_valid & src_sample_valid
-                losses = torch_sq_distance(
-                    sample_src_verts[sample_valid], sample_trg_verts[sample_valid])
-            else:
-                losses = torch_sq_distance(
-                    src.points[valid_idx][sample_valid], sample_trg_verts[sample_valid])
-        
+            losses = torch_sq_distance(src.points[valid_idx][sample_valid], 
+                                       sample_trg_verts[sample_valid]
+                                      )
         elif loss_type == 'point-plane':
             if src_seg is not None:
-                sample_trg, _, sample_valid = bilinear_sample([trg.points, trg.norms, trg.seg_conf], 
-                    v, u, index_map=trg.index_map)
+                sample_trg, _, sample_valid = bilinear_sample([trg.points, 
+                                                               trg.norms, 
+                                                               trg.seg_conf
+                                                              ], 
+                                                              v, 
+                                                              u, 
+                                                              index_map=trg.index_map
+                                                             )
                 sample_trg_seg_conf = sample_trg[2]
-                sample_trg_seg_conf = sample_trg_seg_conf / sample_trg_seg_conf.sum(1, keepdim=True) # Normalize
+                sample_trg_seg_conf = sample_trg_seg_conf.softmax(1)
             else:
+                # ALL valid are false
                 sample_trg, _, sample_valid = bilinear_sample([trg.points, trg.norms], 
                     v, u, index_map=trg.index_map)
-
-                # sample_grid = torch.stack([u / (opt.width-1) * 2 - 1, v / (opt.height-1) * 2 - 1], dim=1)[None, :, None, :].type(fl32_)
-                # sample_trg_verts = F.grid_sample(inputs[("pcd", 0)].permute(0, 3, 1, 2), 
-                #                                  sample_grid,
-                #                                  align_corners=True
-                #                                 )[0, :, :, 0].permute(1, 0)
-                # sample_trg_norms = F.grid_sample(inputs[("normal", 0)].permute(0, 3, 1, 2), 
-                #                                  sample_grid
-                #                                 )[0, :, :, 0].permute(1, 0)
-                # sample_valid = ~ torch.any(
-                #                            torch.isnan(torch.cat([sample_trg_verts, sample_trg_norms], dim=1))
-                #                            , dim=1
-                #                           )
             sample_trg_verts, sample_trg_norms = sample_trg[0], sample_trg[1]
 
-            if 'sample_src_verts' in locals():
-                sample_valid = sample_valid & src_sample_valid
-                losses = torch_inner_prod(
-                    sample_trg_norms[sample_valid],
-                    sample_src_verts[sample_valid] - sample_trg_verts[sample_valid])
-            else:
-                losses = torch_inner_prod(
-                    sample_trg_norms[sample_valid],
-                    src.points[valid_idx][sample_valid] - sample_trg_verts[sample_valid])
-                # losses = (torch_inner_prod(
-                #     src.norms[valid_idx][sample_valid],
-                #     src.points[valid_idx][sample_valid] - sample_trg_verts[sample_valid])**2)
+            losses = torch_inner_prod(sample_trg_norms[sample_valid],
+                                      src.points[valid_idx][sample_valid] - sample_trg_verts[sample_valid]
+                                     )**2
 
-            if square_loss:
-                losses = losses ** 2
-
-        if max_losses is not None:
-            losses = torch.where(losses < max_losses, losses, 0.)
-
-        if min_losses is not None:
-            losses = torch.where(losses > min_losses[valid_idx], losses, 0.)
+        if max is not None:
+            losses = losses[losses < max]
 
         if (huber_th > 0) or (src_seg is not None):
             weights_list = []
@@ -447,29 +379,18 @@ class DataLoss(): # Loss
             if src_seg is not None:
                 src_seg = src_seg[valid_idx]
                 src_seg_conf = src_seg_conf[valid_idx]
-                sample_trg_seg = torch.argmax(sample_trg_seg_conf, dim=1).long()
 
-                # src_counter_seman_conf = src_seman_conf[torch.arange(len(sample_trg_seman), dtype=long_), sample_trg_seman]
-                # src_seman_conf = src_seman_conf[torch.arange(len(src_seman), dtype=long_), src_seman]
-                # sample_trg_seman_conf = sample_trg_seman_conf[torch.arange(len(sample_trg_seman), dtype=long_), sample_trg_seman]
-                # if opt.sf_hard_seman_point_plane:
-                #     weights = torch.where(src_seman == sample_trg_seman, 
-                #                       src_seman_conf * sample_trg_seman_conf, 
-                #                       torch.tensor(0, dtype=fl64_).cuda())
-                # elif opt.sf_soft_seman_point_plane:
-                #     weights = torch.where(src_seman == sample_trg_seman, 
-                #                       src_seman_conf * sample_trg_seman_conf, 
-                #                       src_counter_seman_conf * sample_trg_seman_conf)
                 assert soft_seg is not None
                 if soft_seg:
-                    weights = torch.exp(- JSD(src_seg_conf, sample_trg_seg_conf))
+                    weights = torch.exp(- 0.1 * JSD(src_seg_conf, sample_trg_seg_conf))
                 else:
+                    sample_trg_seg = torch.argmax(sample_trg_seg_conf, dim=1).long()
                     weights = torch.where(src_seg == sample_trg_seg, 
-                                          torch.tensor(1, dtype=fl64_).cuda(), 
-                                          torch.tensor(0, dtype=fl64_).cuda())
+                                          torch.tensor(1, dtype=torch.float64).cuda(), 
+                                          torch.tensor(0, dtype=torch.float64).cuda())
                 
                 weights_list.append(weights[sample_valid].detach())
-        
+
             if len(weights_list) == 1:
                 weights = weights_list[0]
             else:
@@ -477,24 +398,7 @@ class DataLoss(): # Loss
                 weights = torch.prod(torch.pow(torch.stack(weights_list, dim=1), power), dim=1)
             losses *= weights
 
-        if output_ids is not None:
-            with torch.no_grad():
-                losses_ids = - torch.ones(len(src.points), dtype=long_).cuda()
-                losses_valid = valid_idx.clone()
-                losses_valid[valid_idx] = sample_valid.cuda()
-                losses_ids[losses_valid] = torch.arange(len(losses)).cuda()
-                losses_ids = losses_ids[output_ids]
-                losses_ids = losses_ids[losses_ids >= 0]
-            losses = torch.index_select(losses, 0, losses_ids)
-
-        if not square_loss:
-            return losses
-        elif reduction == 'mean':
-            return losses.mean()
-        elif reduction == 'sum':
-            return losses.sum()
-        else:
-            assert False
+        return losses.sum()
 
 class ARAPLoss():
 
@@ -551,7 +455,7 @@ class ARAPLoss():
             return torch.pow(loss,2)
 
     @staticmethod
-    def autograd_forward(input, beta, reduction='mean'):
+    def autograd_forward(input, beta):
         nodes = input.points
         knn_indices = input.knn_indices
         knn_w = input.knn_w
@@ -566,12 +470,7 @@ class ARAPLoss():
         loss = knn_w * torch.pow(loss, 2).sum(-1)
         loss = loss.sum(-1)
         
-        if reduction == 'mean':
-            return loss.mean()
-        elif reduction == 'sum':
-            return loss.sum()
-        else:
-            assert False
+        return loss.sum()
 
 class RotLoss():
 
@@ -600,126 +499,7 @@ class RotLoss():
             return torch.pow(loss, 2)
 
     @staticmethod
-    def autograd_forward(beta, reduction='mean', square_loss=True):
-        # loss = 1. - torch.sum(torch.pow(beta[:, 0:4],2), dim=1)
+    def autograd_forward(beta):
         loss = 1. - torch.matmul(beta[:, 0:4][:, None, :], beta[:, 0:4][:, :, None])[:, 0, 0]
-        # loss = torch.cat([loss, torch.norm(beta[:, 4:], dim=1)])
-
-        if square_loss:
-            loss = torch.pow(loss, 2)
-
-        if not square_loss:
-            return loss
-        elif reduction == 'mean':
-            return loss.mean()
-        elif reduction == 'sum':
-            return loss.sum()
-        else:
-            assert False
-
-# class CorrLoss(Loss):
-
-#     def __init__(self, point_loss=False, point_plane_loss=False):
-#         if point_loss:
-#             self.inc_idx = torch.tensor([[0,1,2,3,4,5,6]], device=dev).repeat(3,1)
-
-#         if corr_method == 'opencv':
-#             self.matcher = cv2Matcher()
-#         elif corr_method == 'kornia':
-#             self.matcher = LoFTR()
-
-#         self.point_loss = point_loss
-#         self.point_plane_loss = point_plane_loss
-
-#     def prepare(self, sfModel, new_data):
-#         # Find correspondence.
-#         m1, m2 = self.matcher.match_features(sfModel.renderImg, new_data.rgb, new_data.ID)
-
-#         if len(m1) == 0:
-#             self.match_num = 0
-#             return
-        
-#         ## Find the indices of matched surfels.
-#         valid_indices = sfModel.projdata[:,0].long()
-#         indices_map = - torch.ones((HEIGHT,WIDTH), dtype=long_, device=dev)
-#         indices_map[sfModel.projdata[:,1].long(), sfModel.projdata[:,2].long()] = valid_indices
-#         sf_indices = indices_map[m1[:,1].long(),m1[:,0].long()] # Indices of matched surfels.
-#         ## Estimate (interpolate) the 3D positions of the matched new points,
-#         ## and estimate the gradient related to these new points.
-#         # target: Nxc, dVdPi: Nxcx2, Pi: project x,y
-#         self.new_points, self.dVdPi = LossTool.bilinear_intrpl_block(m2[:,1], m2[:,0], \
-#             new_data.points, grad=True)
-        
-#         new_valid = new_data.valid.type(fl32_).view(-1,1)
-#         new_valid[new_valid == 0] = float('nan')
-#         new_valid, _ = LossTool.bilinear_intrpl_block(m2[:,1], m2[:,0], new_valid)
-#         valid_pair = (sf_indices >= 0) & (~torch.isnan(new_valid[:,0]))
-#         self.match_num = torch.count_nonzero(valid_pair)
-#         if self.match_num > 0:
-#             sf_indices = sf_indices[valid_pair]
-#             self.new_points = self.new_points[valid_pair].type(fl32_)
-#             self.dVdPi = self.dVdPi[valid_pair]
-        
-#             self.sf_knn_weights = sfModel.sf_knn_weights[sf_indices]
-#             self.sf_knn_indices = sfModel.sf_knn_indices[sf_indices]
-#             self.sf_knn = sfModel.ED_nodes.points[self.sf_knn_indices]
-#             self.sf_diff = sfModel.points[sf_indices].view(-1,1,3) - self.sf_knn
-#             self.skew_v = get_skew(self.sf_diff)
-
-#             self.J_size = (self.match_num * 3, sfModel.ED_nodes.param_num)
-#             if self.point_loss:
-#                 self.J_idx = LossTool.prepare_Jacobian_idx(3, \
-#                     self.sf_knn_indices, self.inc_idx)
-
-#     def forward(self, lambda_, beta, new_data, grad=False, dldT_only=False):
-
-#         if self.match_num > 0:
-
-#             trans_points, Jacobian_elements = Trans_points(self.sf_diff, \
-#                     self.sf_knn, beta[self.sf_knn_indices], self.sf_knn_weights, \
-#                     grad=grad, skew_v=self.skew_v)
-
-#             trans_points = trans_points.type(fl32_)
-#             loss = lambda_ * (trans_points - self.new_points).view(-1,1)
-        
-#             if grad:
-#                 Jacobian_elements = Jacobian_elements.type(fl32_)
-#                 dTdq = torch.flatten(torch.transpose(Jacobian_elements,1,2), start_dim=2) # Nx3x(4x4)
-#                 dPidT = LossTool.dPi_block(trans_points) # Nx2x3(x,y,z)
-
-#                 dVdT = torch.matmul(self.dVdPi, dPidT) # dVdPi: Nxcx2, dPidT: Nx2x3(x,y,z), dVdT: Nxcx3
-#                 del dPidT
-                
-#                 if dldT_only:
-#                     dVdT = -dVdT.squeeze(1)
-#                     dVdT[:,2] += 1.
-#                     dVdT *= lambda_
-#                     return torch.block_diag(*dVdT)
-
-#                 else:
-#                     match_num = len(trans_points)
-
-#                     # dVdT: Nxcx3, dTdq: Nx3x(n_neighborsx4), v: Nxcxn_neighborsx4
-#                     v = Jacobian_elements.permute(0,2,1,3) - \
-#                         torch.matmul(dVdT,dTdq).view(match_num,3,n_neighbors,4)
-#                     vb = - dVdT.unsqueeze(2).repeat(1,1,4,1) # Nxcxn_neighborsx3
-#                     vb[:,0,:,0] += 1.
-#                     vb[:,1,:,1] += 1.
-#                     vb[:,2,:,2] += 1.
-#                     vb *= self.sf_knn_weights.unsqueeze(1).unsqueeze(-1) # weights: Nx1x4x1
-                    
-#                     v = torch.cat([v,vb], dim=-1).flatten() #Nxcxn_neighborsx7
-                
-#                     Jacobian = torch.sparse_coo_tensor(self.J_idx, \
-#                         lambda_ * v.flatten(), self.J_size, dtype=fl32_)
-
-#                     return LossTool.prepare_jtj_jtl(Jacobian, loss)
-                
-#             else:
-#                 return torch.pow(loss,2)
-
-#         elif grad:
-#             return None, None
-        
-#         else:
-#             return None
+        loss = torch.pow(loss, 2)
+        return loss.sum()

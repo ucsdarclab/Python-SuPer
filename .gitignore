@@ -140,3 +140,6 @@ copy
 
 *.jpg
 *.png
+
+pretrain
+experiments

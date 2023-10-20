@@ -8,8 +8,9 @@ from utils.utils import *
 from super.loss import *
 
 class LM_Solver():
-    def __init__(self, opt):
+    def __init__(self, opt, convs=None):
 
+        self.opt = opt
         self.device = torch.device("cpu" if not torch.cuda.is_available() else "cuda")
         
         self.losses = []
@@ -17,9 +18,6 @@ class LM_Solver():
         if opt.sf_point_plane:
             self.losses.append(DataLoss())
             self.lambdas.append(opt.sf_point_plane_weight)
-        # if depth_cost:
-        #     self.losses.append(FeatLoss(use_point=True))
-        #     self.lambdas.append(depth_lambda)
         if opt.mesh_arap:
             self.losses.append(ARAPLoss())
             self.lambdas.append(opt.mesh_arap_weight)
@@ -31,6 +29,9 @@ class LM_Solver():
         #     self.lambdas.append(corr_lambda)
 
         self.phase = opt.phase
+
+        if self.phase == "train":
+            self.convs = convs
 
     # Solvers.
     @staticmethod
@@ -44,7 +45,7 @@ class LM_Solver():
             x = torch.lu_solve(b, A_LU, pivots)
 
         elif method == "cholesky":
-            U = torch.cholesky(A)
+            U = torch.linalg.cholesky(A)
             x = torch.cholesky_solve(b, U)
         
         return x
@@ -77,14 +78,16 @@ class LM_Solver():
             return torch.sum(torch.cat(loss))
 
     # LM algorithm
-    def LM(self, sf, inputs, new_data, u = 10, v = 7.5, minimal_loss = 1e10, num_Iter=10):
+    def LM(self, sf, inputs, new_data, u = 10, v = 7.5, minimal_loss = 1e10):
+        num_Iter = self.opt.num_optimize_iterations
 
         # Init quaternion and translation parameters.
-        best_beta = torch.tensor([[1.,0.,0.,0.,0.,0.,0.]], 
+        beta = torch.tensor([[1.,0.,0.,0.,0.,0.,0.]], 
                                 dtype=torch.float64, 
                                 device=self.device
                                 ).repeat(sf.ED_nodes.num,1)
-        beta = copy.deepcopy(best_beta)
+        if self.phase == "test":
+            best_beta = copy.deepcopy(beta)
 
         jtj_diag_i = torch.arange(sf.ED_nodes.param_num, device=self.device)
         for loss_term in self.losses: 
@@ -103,11 +106,7 @@ class LM_Solver():
 
             loss = self.prepareCostTerm(sf, inputs, new_data, beta)
             
-            if self.phase == "train": # TODO
-                minimal_loss = loss
-                u /= v
-
-            elif self.phase == "test":
+            if self.phase == "test":
                 if loss < minimal_loss: # Accept the step.
                     minimal_loss = loss
                     u /= v
@@ -117,6 +116,7 @@ class LM_Solver():
                     u *= v
                     beta = copy.deepcopy(best_beta)
 
-        sf.logger.info(f"{inputs['ID'].item()} loss: {loss}")
+        if self.opt.phase == "test":
+            sf.logger.info(f"{inputs['ID'].item()} loss: {loss}")
 
         return beta

@@ -5,30 +5,24 @@ Stand-alone utility to generate segmentation mask for 1 surgical image as input
 Note: If you get error with DeepLabV3+, please see bottom of inference.py
 '''
 
-# torch imports
-from tkinter import Frame
+# from tkinter import Frame
 import torch
 
 import segmentation_models_pytorch as smp
-import cv2
-import utils
-import matplotlib.pyplot as plt
+# import cv2
+# import utils
+# import matplotlib.pyplot as plt
 
-# general imports
-import argparse
-import os
+# import argparse
+# import os
 
-# utility imports
 import numpy as np
-from torchvision.transforms.transforms import ToTensor
-from PIL import Image
+# from torchvision.transforms.transforms import ToTensor
+# from PIL import Image
 import json
 from tqdm import tqdm
 
-from utils.utils import *
-
-# model imports
-import torchvision.transforms.functional as TF
+# import torchvision.transforms.functional as TF
 import torch.nn.functional as F
 
 
@@ -136,7 +130,7 @@ def load_seg_model(classes_path, model_path):
 
 def generate_mask(seg_model, img):
     N = img.size(0)
-    img = img.repeat(2, 1, 1, 1) # TODO: Solve the batch_size=1 bug.
+    img = img.repeat(2, 1, 1, 1)
 
     # Add option to reflect confidence level not mask
     seg = seg_model(img)
